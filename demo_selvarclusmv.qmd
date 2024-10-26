@@ -1,0 +1,2218 @@
+---
+title: "Demo: SelvarClustMV"
+author: "Ho Huu Binh"
+date: "`r Sys.Date()`"
+toc: true
+format:
+  html: 
+    toc: true
+    toc_float: true
+    code: true
+    code-fold: true
+    code-tools: true
+  pdf: 
+    fontsize: "12"
+    toc: true
+    number-sections: true
+    number-depth: 3
+---
+
+Progress:
+26/10
++ Reimplemented function with correct fitting vectors of # clusters: Done
++ Simple parallel: Done
++ Check bug: Done
+  - Adding variables logic: Done 
+  - Number of variables in Sc: Done
++ Check Maugis with 
+  - no missing values: Pass
+  - missing values: Fail
++ Testing SelVarMix package: Not done (Package )
+
+```{r, warning=F, message=F}
+library(MixAll)
+library(MASS)
+library(mclust)
+library(clustvarsel)
+library(stats)
+library(VarSelLCM)
+library(BMA)
+library(mlogitBMA)
+library(mlogit)
+library(foreach)
+library(parallel)
+library(doParallel)
+library(iterators)
+library(reshape2)
+library(ggplot2)
+
+rm(list=ls())
+source("amputation.R")
+```
+
+## BIC reg
+
+```{r}
+BICreg <- function(x, y)
+{
+  x <- as.matrix(x)
+  y <- as.vector(y)
+  n <- length(y)
+  mod <- bicreg(y = y, x = x, nbest = 1)
+  subset <- which(mod$which[1,])
+  mod <- lm.fit(y = y, x = cbind(1,x[,subset]))
+  # calculate the BIC for the regression
+  sigma <- sqrt(mean(residuals(mod)^2))
+  p <- n - df.residual(mod) + 1
+  -n*log(2*pi) -2*n*log(sigma) -n -log(n)*p
+}
+```
+
+## Parallel
+
+```{r}
+
+startParallel <- function(parallel = TRUE, ...)
+{
+# Start parallel computing 
+  
+  # check availability of parallel and doParallel (their dependencies, i.e. 
+  # foreach and iterators, are specified as Depends on package DESCRIPTION file)
+  if(!all(requireNamespace("parallel", quietly = TRUE),
+          requireNamespace("doParallel", quietly = TRUE)))     
+     stop("packages 'parallel' and 'doParallel' required for parallelization!")
+  
+  # if a cluster is provided as input argument use that cluster and exit
+  if(any(class(parallel) == "cluster"))
+    { cl <- parallel
+      parallel <- TRUE
+      attr(parallel, "type") <- getDoParName()
+      attr(parallel, "cores") <- getDoParWorkers()
+      attr(parallel, "cluster") <- cl
+      return(parallel)
+  }
+  
+  # set default parallel functionality depending on system OS:
+  # - snow functionality on Windows OS
+  # - multicore functionality on Unix-like systems (Unix/Linux & Mac OSX)
+  parallelType <- if(.Platform$OS.type == "windows") 
+                    "snow" else "multicore"
+
+  # get the current number of cores available
+  numCores <- parallel::detectCores()
+
+  # set parameters for parallelization
+  if(is.logical(parallel))
+    { NULL }
+  else if(is.numeric(parallel))
+    { numCores <- as.integer(parallel)
+      parallel <- TRUE }
+  else if(is.character(parallel))
+    { parallelType <- parallel
+      parallel <- TRUE 
+    }
+  else parallel <- FALSE
+  
+  attr(parallel, "type") <- parallelType
+  attr(parallel, "cores") <- numCores
+
+  # start "parallel backend" if needed
+  if(parallel)
+  { 
+    if(parallelType == "snow")
+      { 
+        # snow functionality on Unix-like systems & Windows
+        cl <- parallel::makeCluster(numCores, type = "PSOCK")
+        attr(parallel, "cluster") <- cl
+        # export parent environment
+        varlist <- ls(envir = parent.frame(), all.names = TRUE)
+        varlist <- varlist[varlist != "..."]
+        parallel::clusterExport(cl, varlist = varlist,
+                                # envir = parent.env(environment())
+                                envir = parent.frame() )
+        # export global environment (workspace)
+        parallel::clusterExport(cl, 
+                                varlist = ls(envir = globalenv(), 
+                                             all.names = TRUE),
+                                envir = globalenv())
+        # load current packages in workers
+        pkgs <- .packages()
+        lapply(pkgs, function(pkg) 
+               parallel::clusterCall(cl, library, package = pkg, 
+                                     character.only = TRUE))
+        #
+        doParallel::registerDoParallel(cl, cores = numCores)
+      }
+      else if(parallelType == "multicore")
+        { # multicore functionality on Unix-like systems
+          cl <- parallel::makeCluster(numCores, type = "FORK")
+          doParallel::registerDoParallel(cl, cores = numCores) 
+          attr(parallel, "cluster") <- cl 
+        }
+      else 
+        { stop("Only 'snow' and 'multicore' clusters allowed!") }
+  }
+
+  return(parallel)
+}
+
+```
+
+## Sequential and parallel backward selection
+
+```{r}
+#############################################################################
+## Sequential & parallel backward greedy search
+#############################################################################
+   
+clvarselgrbkw <- function(X, G = 1:9,
+                          emModels1 = c("E","V"), 
+                          emModels2 = mclust.options("emModelNames"),
+                          samp = FALSE, sampsize = 2000, 
+                          hcModel = "VVV", allow.EEE = TRUE, forcetwo = TRUE, 
+                          BIC.diff = 0, itermax = 100,
+                          parallel = FALSE, 
+                          verbose = interactive())
+{
+
+  X <- as.matrix(X)
+  n <- nrow(X) # number of rows = number of observations
+  d <- ncol(X) # number of columns = number of variables
+  if(is.null(colnames(X))) 
+    colnames(X) <- paste("X", 1:d, sep = "")
+  G <- setdiff(G, 1)
+  
+  # If needed, sample the subset of observations for hierarchical clustering
+  if(samp) { sub <- sample(1:n, min(sampsize,n), replace = FALSE) }
+  else     { sub <- seq.int(1,n) }
+
+  hcModel1 <- if(any(grep("V", hcModel))) "V" else "E"
+
+  # info records the proposed variable, BIC for clustering using the S matrix
+  # and BICdiff for BIC difference of clustering versus no clustering on S
+  info <- as.data.frame(matrix(as.double(NA), nrow = 0, ncol = 7))
+  #info <- data.frame(Var = NULL, BIC = NULL, BICdiff = NULL, 
+  #                   Step = NULL, Decision = NULL,
+  #                   stringsAsFactors = FALSE)
+  S <- X
+  NS <- matrix(as.double(NA), n, 0)
+
+  mod <- NULL
+  try(mod <- Mclust(S, G = G, modelNames = emModels2,
+                    initialization = list(hcPairs = hc(hcModel, data = S[sub,]), 
+                                          subset = sub),
+                    verbose = FALSE),
+      silent = TRUE)
+  # If we get all NA's from above starting hierarchical values use "EEE"
+  if((allow.EEE) & (sum(is.finite(mod$BIC))==0))
+    { try(mod <- Mclust(S, G = G, modelNames = emModels2,
+                        initialization = list(hcPairs = hc("EEE", data = S[sub,]),
+                                              subset = sub),
+                        verbose = FALSE),
+          silent = TRUE)
+    }
+  # BICS is the BIC for the clustering model with all variables in S
+  BICS <- if(sum(is.finite(mod$BIC))==0) NA 
+          else max(mod$BIC[is.finite(mod$BIC)])
+
+  # Start "parallel backend" if needed
+  if(is.logical(parallel))
+    { if(parallel) 
+        { parallel <- startParallel(parallel)
+          stopCluster <- TRUE }
+      else
+      { parallel <- stopCluster <- FALSE } 
+    }
+  else
+    { stopCluster <- if(inherits(parallel, "cluster")) FALSE else TRUE
+      parallel <- startParallel(parallel) 
+    }
+  on.exit(if(parallel & stopCluster)
+          parallel::stopCluster(attr(parallel, "cluster")) )
+
+  # define operator to use depending on parallel being TRUE or FALSE
+  `%DO%` <- if(parallel) `%dopar%` else `%do%`
+  i <- NULL # dummy to trick R CMD check 
+  
+  criterion <- 1
+  iter <- 0
+  
+  while((criterion == 1) & (iter < itermax) & (ncol(S) > 1))
+  {
+   iter <- iter+1
+   check1 <- colnames(S)
+   
+   if(verbose) cat(paste("iter", iter, "\n"))
+   # removing step
+   if(verbose) cat("- removing step\n")
+   out <- foreach(i = 1:ncol(S)) %DO% 
+   {
+     # Calculate the BIC for the regression of the proposed variable on 
+     # the other variable(s) in S
+     BICreg <- BICreg(y = S[,i], x = S[,-i,drop=FALSE])        
+     # Fit the cluster model on the S/{i} variables for 2 to G groups 
+     mod <- NULL
+     hcPairs <- hc(modelName = if(ncol(S) > 2) hcModel else hcModel1,
+                   data = S[,-i,drop=FALSE][sub,],
+                   use = ifelse(ncol(S[,-i,drop=FALSE]) > 1,
+                                mclust.options("hcUse"), "VARS"))
+     try(mod <- Mclust(S[,-i,drop=FALSE], G = G, 
+                       modelNames = if(ncol(S) > 2) emModels2
+                                               else emModels1,
+                       initialization = list(hcPairs = hcPairs, 
+                                             subset = sub),
+                       verbose = FALSE),
+         silent = TRUE)
+     # If we get all NA's from above starting hierarchical values use "EEE"
+     if((allow.EEE) & (sum(is.finite(mod$BIC))==0))
+       { hcPairs <- hc(if(ncol(S) > 2) "EEE" else "E",
+                       data = S[,-i,drop=FALSE][sub,])
+         try(mod <- Mclust(S[,-i,drop=FALSE], G = G, 
+                           modelNames = if(ncol(S) > 2) emModels2
+                                                   else emModels1,
+                           initialization = list(hcPairs = hcPairs, 
+                                                 subset = sub),
+                           verbose = FALSE),
+             silent = TRUE) 
+       }
+     # BIC for the no clustering model on S/{j} 
+     BICnotclust <- if(sum(is.finite(mod$BIC))==0) NA
+                    else (max(mod$BIC[is.finite(mod$BIC)]) + BICreg)
+     #
+     return(list(BICreg, BICnotclust, mod$modelName, mod$G))
+   }
+   BICreg <- sapply(out, "[[", 1)
+   BICnotclust <- sapply(out, "[[", 2)
+   # cdiff is the difference between BIC for clustering on S versus {j} 
+   # being conditionally independent of the clustering
+   cdiff <- BICS - BICnotclust
+   # Choose the variable with the smallest difference 
+   m <- min(cdiff[is.finite(cdiff)])
+   arg <- which(cdiff == m, arr.ind=TRUE)[1]
+   if(cdiff[arg] < BIC.diff)
+     { # if this difference is smaller than cut-off remove this variable 
+       # from S and update the clustering model BICS
+       BICS <- BICS - BICreg[arg] - cdiff[arg]
+       nks <- c(colnames(NS), colnames(S)[arg])
+       k <- colnames(S)[-arg]
+       if(nrow(info) > 0)
+         info <- rbind(info,
+                       c(colnames(S)[arg], BICS, cdiff[arg], 
+                       "Remove", "Accepted", out[[arg]][3:4])) 
+       else
+         info <- data.frame(Var = colnames(S)[arg], 
+                            BIC = BICS, BICdiff = cdiff[arg], 
+                            Step = "Remove", Decision = "Accepted",
+                            Model = out[[arg]][[3]],
+                            G = out[[arg]][[4]],
+                            stringsAsFactors = FALSE)
+       NS <- cbind(NS, S[,arg])
+       S <- S[,-arg,drop=FALSE]
+       colnames(NS) <- nks
+       colnames(S) <- k
+     } 
+   else
+     { if(nrow(info) > 0)
+         info <- rbind(info, 
+                       c(colnames(S)[arg], 
+                         (BICnotclust-BICreg)[arg], cdiff[arg],
+                         "Remove", "Rejected", out[[arg]][3:4]))
+       else
+         info <- data.frame(Var = colnames(S)[arg], 
+                            BIC = BICS, BICdiff = cdiff[arg], 
+                            Step = "Remove", Decision = "Rejected",
+                            Model = out[[arg]][[3]],
+                            G = out[[arg]][[4]],
+                            stringsAsFactors = FALSE)
+     }
+
+   if(ncol(NS) > 2)
+     { # adding step 
+       if(verbose) cat("+ adding step\n")
+       out <- foreach(i = 1:ncol(NS)) %DO% 
+       {
+         # Fit clustering model with proposed variable
+         hcPairs <- hc(modelName = if(ncol(S) > 0) hcModel else hcModel1,
+                       data = cbind(S,NS[,i])[sub,])
+         try(mod <- Mclust(cbind(S,NS[,i]), G = G, 
+                           modelNames = if(ncol(S) > 0) emModels2 
+                                        else            emModels1,
+                           initialization = list(hcPairs = hcPairs,
+                                                 subset = sub),
+                           verbose = FALSE),
+             silent = TRUE)
+         # If we get all NA's from above starting hierarchical values use "EEE"
+         if((allow.EEE) & (sum(is.finite(mod$BIC))==0))
+           { hcPairs <- hc(if(ncol(S) > 0) "EEE" else "E",
+                           data = cbind(S,NS[,i])[sub,])
+             try(mod <- Mclust(cbind(S,NS[,i]), G = G, 
+                               modelNames = if(ncol(S) > 0) "EEE" else "E",
+                               initialization = list(hcPairs = hcPairs,
+                                                     subset = sub),
+                               verbose = FALSE),
+                silent = TRUE)
+           }
+         # BICS is the BIC for the clustering model with all variables in S
+         BICNS <- if(sum(is.finite(mod$BIC))==0) NA 
+                  else max(mod$BIC[is.finite(mod$BIC)])
+         # Calculate the BIC for the regression of the proposed variable 
+         # on the other variable(s) in S
+         BICreg <- BICreg(y = NS[,i], x = S)
+         #         
+         return(list(BICreg, BICNS, mod$modelName, mod$G))
+       }
+       BICreg <- sapply(out, "[[", 1)
+       BICNS <- sapply(out, "[[", 2)
+       # cdiff is the difference between BIC for clustering on S u NS versus
+       # being conditionally independent of the clustering
+       cdiff <- BICNS - (BICS + BICreg)
+       # Choose the variable with the largest difference 
+       m <- max(cdiff[is.finite(cdiff)])
+       arg <- which(cdiff==m,arr.ind=TRUE)[1]
+       if(cdiff[arg] > BIC.diff)
+         { # if this difference is larger than cut-off add this variable 
+           # to S and update the clustering model BICS
+           BICS <- BICNS[arg]
+           k <- c(colnames(S), colnames(NS)[arg])
+           nks <- colnames(NS)[-arg]
+           info <- rbind(info, c(colnames(NS)[arg], BICS, cdiff[arg], 
+                                 "Add", "Accepted", out[[arg]][3:4]))
+           S <- cbind(S,NS[,arg])
+           NS <- NS[,-arg,drop=FALSE]
+           colnames(S) <- k
+           colnames(NS) <- nks
+         } 
+       else
+         { info <- rbind(info, c(colnames(NS)[arg], BICNS[arg], cdiff[arg],
+                                 "Add", "Rejected", out[[arg]][3:4]))
+         }
+   }
+   
+   info$BIC <- as.numeric(info$BIC)
+   info$BICdiff <- as.numeric(info$BICdiff)
+
+   if(verbose) 
+     { if(iter > 2) print(info[seq(nrow(info)-1,nrow(info)),c(1,3:5)])
+       else         print(info[nrow(info),c(1,3:5),drop=FALSE]) }
+   
+   # Check if the variables in S have changed or not
+   check2 <- colnames(S)
+   if(is.null(check2))
+     # all variables have been removed
+     { criterion <- 0 }
+   else
+     # if they have changed (either added one or removed one or changed one)
+     # then continue the algorithm (criterion is 1) otherwise stop 
+     # (criterion is 0)
+     { if(length(check2) != length(check1))
+         { criterion <- 1 }
+       else
+         { criterion <- if(sum(check1==check2) != length(check1)) 1 else 0 }
+     }
+        
+  }
+
+  if(iter >= itermax) 
+    warning("Algorithm stopped because maximum number of iterations was reached")
+  
+  # List the selected variables and the matrix of steps' information
+  info$BIC <- as.numeric(info$BIC)
+  info$BICdiff <- as.numeric(info$BICdiff)
+  # reorder steps.info
+  info <- info[,c(1,4,2,6,7,3,5),drop=FALSE]
+  colnames(info) <- c("Variable proposed", "Type of step",
+                      "BICclust", "Model", "G", "BICdiff", "Decision")
+  varnames <- colnames(X)
+  subset <- if(is.null(S)) NULL else
+               sapply(colnames(S), function(x) which(x == varnames))
+
+  out <- list(variables = varnames,
+              subset = subset,
+              steps.info = info,
+              search = "greedy",
+              direction = "backward")
+  class(out) <- "clustvarsel"  
+  return(out)
+}
+```
+# Main Algorithm Loop
+
+The main part of the algorithm is a while loop that continues until no more changes are made or the maximum number of iterations is reached. In each iteration:
+
+1.  It attempts to remove each variable and evaluates the impact on the clustering.
+2.  If removing a variable improves the model (based on BIC), it's removed.
+3.  If there are variables not in the current subset, it attempts to add them back.
+4.  This process continues until no improvements can be made.
+
+# Incorporate missing values and mixed data treatment 
+## Final Version
+```{r}
+clvarselgrbkw_mixall <- function(X, G = 2:9, strategy = clusterStrategy(),
+                                 samp = FALSE, sampsize = 2000,
+                                 BIC.diff = 0, itermax = 100,
+                                 verbose = interactive())
+{
+  # Convert X to a data frame if it's not already
+  X <- as.data.frame(X)
+  n <- nrow(X) # number of rows = number of observations
+  d <- ncol(X) # number of columns = number of variables
+  if(is.null(colnames(X))) 
+    colnames(X) <- paste("X", 1:d, sep = "")
+  G <- setdiff(G, 1)
+  
+  # If needed, sample the subset of observations
+  if(samp) { sub <- sample(1:n, min(sampsize,n), replace = FALSE) }
+  else     { sub <- seq.int(1,n) }
+
+  # Function to determine data type
+  get_data_type <- function(col) {
+    if (is.numeric(col) && all(col %% 1 == 0, na.rm = TRUE)) {
+      return("poisson")
+    } else if (is.factor(col) || is.character(col)) {
+      return("categorical")
+    } else {
+      return("gaussian")
+    }
+  }
+
+  # Prepare data and determine clustering function
+  prepare_data_and_cluster_function <- function(data) {
+    data_types <- sapply(data, get_data_type)
+    unique_types <- unique(data_types)
+    
+    if (length(unique_types) == 1) {
+      # Single data type
+      cluster_fun <- switch(unique_types,
+                            "poisson" = clusterPoisson,
+                            "categorical" = clusterCategorical,
+                            "gaussian" = clusterDiagGaussian)
+      models <- lapply(unique_types, function(type) {
+        switch(type,
+               "poisson" = "poisson_pk_ljk",
+               "categorical" = "categorical_pk_pjk",
+               "gaussian" = "gaussian_pk_sjk")
+      })
+      return(list(data = data, models = models[[1]], 
+                  cluster_fun = cluster_fun, is_mixed = FALSE))
+    } else {
+      # Mixed data types
+      data_list <- lapply(unique_types, function(type) {
+        data[, data_types == type, drop = FALSE]
+      })
+      models <- lapply(unique_types, function(type) {
+        switch(type,
+               "poisson" = "poisson_pk_ljk",
+               "categorical" = "categorical_pk_pjk",
+               "gaussian" = "gaussian_pk_sjk")
+      })
+      return(list(data = data_list, models = models, 
+                  cluster_fun = clusterMixedData, 
+                  is_mixed = TRUE))
+    }
+  }
+
+  # Function to fit clustering model
+  fit_cluster_model <- function(data, G) {
+    tryCatch({
+      prepared <- prepare_data_and_cluster_function(data)
+      if (prepared$is_mixed) {
+        model <- prepared$cluster_fun(prepared$data, nbCluster = G, 
+                                      strategy = strategy, criterion = "BIC", 
+                                      models = prepared$models, nbCore = 0)
+      } else {
+        model <- prepared$cluster_fun(prepared$data, nbCluster = G, 
+                                      strategy = strategy, criterion = "BIC",
+                                      models = prepared$models, nbCore = 0)
+      }
+      return(list(model = model, BIC = -model@criterion, nbCluster = model@nbCluster))
+    }, error = function(e) {
+      return(list(model = NULL, BIC = -Inf, nbCluster = NA))
+    })
+  }
+
+  # Initialize variables
+  S <- X
+  NS <- data.frame(matrix(ncol = 0, nrow = nrow(X)))
+  info <- data.frame(Var = character(), BIC = numeric(), BICdiff = numeric(), 
+                     Step = character(), Decision = character(), 
+                     Model = character(), G = integer(), 
+                     stringsAsFactors = FALSE)
+
+  # Initial clustering
+  if (verbose) cat("Initialize model\n")
+  init_model <- fit_cluster_model(S, G)
+  BICS <- init_model$BIC
+
+  criterion <- 1
+  iter <- 0
+
+  while((criterion == 1) & (iter < itermax) & (ncol(S) > 1)) {
+    iter <- iter + 1
+    if(verbose) cat(paste("iter", iter, "\n"))
+
+    # Removing step
+    if(verbose) cat("- removing step\n")
+    remove_results <- lapply(1:ncol(S), function(i) {
+      S_minus_i <- S[, -i, drop = FALSE]
+      model_minus_i <- fit_cluster_model(S_minus_i, G)
+      
+      # Calculate BIC for regression of removed variable on remaining variables
+      fully_observed <- complete.cases(S_minus_i)
+      S_minus_i_obs <- S_minus_i[fully_observed, , drop = FALSE]
+      S_i_obs <- S[fully_observed, i, drop = FALSE]
+      BICreg <- compute_bic_reg(S_minus_i_obs, S_i_obs,
+                                family = get_data_type(S[, i]))
+      
+      # Total BIC after removal
+      BIC_total <- model_minus_i$BIC + BICreg
+      
+      return(list(BIC_total = BIC_total, BICreg = BICreg, 
+                  model = model_minus_i$model, nbCluster = model_minus_i$nbCluster))
+    })
+    BIC_remove <- sapply(remove_results, function(x) x$BIC_total)
+    BIC_reg <- sapply(remove_results, function(x) x$BICreg) 
+    cdiff_remove <- BICS - BIC_remove
+    m_remove <- min(cdiff_remove)
+    arg_remove <- which.min(cdiff_remove)
+
+    if(m_remove < BIC.diff) {
+      # Remove variable
+      removed_var <- colnames(S)[arg_remove]
+      BICS <- BICS - BIC_reg[arg_remove] - cdiff_remove[arg_remove]
+      info <- rbind(info, data.frame(
+        Var = removed_var, BIC = BICS, BICdiff = m_remove,
+        Step = "Remove", Decision = "Accepted",
+        Model = class(remove_results[[arg_remove]]$model)[1],
+        G = remove_results[[arg_remove]]$nbCluster,
+        stringsAsFactors = FALSE
+      ))
+      NS[[removed_var]] <- S[[removed_var]]
+      S <- S[, -arg_remove, drop = FALSE]
+    } else {
+      info <- rbind(info, data.frame(
+        Var = colnames(S)[arg_remove], BIC = BICS, BICdiff = m_remove,
+        Step = "Remove", Decision = "Rejected",
+        Model = class(remove_results[[arg_remove]]$model)[1],
+        G = remove_results[[arg_remove]]$nbCluster,
+        stringsAsFactors = FALSE
+      ))
+    }
+
+    # Adding step
+    if(ncol(NS) > 2) {
+      if(verbose) cat("+ adding step\n")
+      add_results <- lapply(1:ncol(NS), function(i) {
+        S_plus_i <- cbind(S, NS[, i, drop = FALSE])
+        model_plus_i <- fit_cluster_model(S_plus_i, G)
+        
+        # Calculate BIC for regression of added variable on current variables
+        fully_observed <- complete.cases(S)
+        S_obs <- S[fully_observed, , drop = FALSE]
+        NS_i_obs <- NS[fully_observed, i, drop = FALSE]
+        BICreg <- compute_bic_reg(S_obs, NS_i_obs, family = get_data_type(NS[, i]))
+        
+        # Total BIC after addition
+        BIC_total <- model_plus_i$BIC 
+        
+        return(list(BIC_total = BIC_total, BICreg = BICreg, 
+                    model = model_plus_i$model, nbCluster = model_plus_i$nbCluster))
+      })
+
+      BIC_add <- sapply(add_results, function(x) x$BIC_total)
+      BIC_reg <- sapply(add_results, function(x) x$BICreg)
+      cdiff_add <- BIC_add - (BICS + BIC_reg)
+      m_add <- max(cdiff_add)
+      arg_add <- which.max(cdiff_add)
+
+      if(m_add > BIC.diff) {
+        # Add variable
+        added_var <- colnames(NS)[arg_add]
+        BICS <- BIC_add[arg_add]
+        info <- rbind(info, data.frame(
+          Var = added_var, BIC = BICS, BICdiff = m_add,
+          Step = "Add", Decision = "Accepted",
+          Model = class(add_results[[arg_add]]$model)[1],
+          G = add_results[[arg_add]]$nbCluster,
+          stringsAsFactors = FALSE
+        ))
+        S[[added_var]] <- NS[[added_var]]
+        NS <- NS[, -arg_add, drop = FALSE]
+      } else {
+        info <- rbind(info, data.frame(
+          Var = colnames(NS)[arg_add], BIC = BIC_add[arg_add], BICdiff = m_add,
+          Step = "Add", Decision = "Rejected",
+          Model = class(add_results[[arg_add]]$model)[1],
+          G = add_results[[arg_add]]$nbCluster,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+
+    if(verbose) {
+      print(info[nrow(info), c("Var", "BICdiff", "Step", "Decision")])
+    }
+
+    # Check if the variables in S have changed
+    criterion <- if(ncol(S) == 0) 0 else 1
+  }
+
+  if(iter >= itermax) 
+    warning("Algorithm stopped because maximum number of iterations was reached")
+
+  # Prepare output
+  varnames <- colnames(X)
+  subset <- if(ncol(S) == 0) NULL else match(colnames(S), varnames)
+
+  # Fit final model to get optimal number of clusters
+  final_model <- fit_cluster_model(S, G)
+  optimal_G <- final_model$nbCluster
+
+  out <- list(
+    variables = varnames,
+    subset = subset,
+    steps.info = info,
+    optimal_G = optimal_G,
+    search = "greedy",
+    direction = "backward"
+  )
+  class(out) <- "clustvarsel"
+  return(out)
+}
+```
+
+## Parallel version
+```{r}
+compute_bic_reg <- function(x, y, family = "gaussian", full_res = FALSE) {
+  # Ensure required packages are loaded
+  required_packages <- c("BMA", "nnet", "mlogitBMA")
+  for (pkg in required_packages) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      stop(paste("Package", pkg, 
+                 "is required but not installed. Please install it."))
+    }
+  }
+  
+  x <- as.matrix(x)
+  
+  if (family != "multinomial") {
+    y <- as.vector(unlist(y)) 
+  } else {
+    y <- as.factor(unlist(y)) 
+  }
+  
+  # Check length
+  if (nrow(x) != length(y)) {
+    stop(paste("Mismatch in lengths: x has", nrow(x), 
+               "rows but y has", length(y), "elements"))
+  }
+  
+  n <- length(y)
+  
+  # Initialize variables
+  selected_vars <- NULL
+  bic_value <- NA
+  fit <- NULL
+  
+  if (family != "multinomial") {
+    bic_model <- bic.glm(x, y, glm.family = family, 
+                         strict = FALSE, nbest = 1)
+    
+    # Select the best model
+    best_model <- bic_model$which[1, ]
+    selected_vars <- which(best_model)
+    
+    # Fit on selected vars
+    if (family == "gaussian") {
+      fit <- lm(y ~ ., data = data.frame(y = y, 
+                                         x = x[, selected_vars, drop = FALSE]))
+    } else if (family == "poisson") {
+      fit <- glm(y ~ ., data = data.frame(y = y, 
+                                          x = x[, selected_vars, drop = FALSE]),
+                 family = poisson())
+    }
+    
+    # Compute BIC
+    bic_value <- -BIC(fit)
+    
+  } else {
+    data_df <- as.data.frame(cbind(y, x))
+    names(data_df)[1] <- "y"
+    
+    f_mnl <- as.formula(paste("y ~", paste(colnames(x), collapse = " + ")))
+    
+    # Perform BMA for Multinomial Logistic Regression
+    bic_model <- tryCatch({
+      bic.mlogit(f = f_mnl, data = data_df, 
+                 base.choice = 1, varying = NULL, sep = ".", 
+                 approx = TRUE, include.intercepts = TRUE, nbest = 1)
+    }, error = function(e) {
+      stop("Error in bic.mlogit: ", e$message)
+    })
+    
+    # Extract the selected variables
+    selected_models <- bic_model$bic.glm$which
+    selected_vars <- which(selected_models)
+    
+    f_sel <- as.formula(paste("y ~", 
+                              paste(colnames(x)[selected_vars], 
+                                    collapse = " + ")))
+    
+    fit <- tryCatch({
+      nnet::multinom(f_sel, data = data_df, trace = FALSE)
+    }, error = function(e) {
+      stop("Error in fitting multinomial model: ", e$message)
+    })
+    
+    # Compute BIC for the multinomial model
+    ll <- logLik(fit)
+    # Number of parameters: (num preds + intercept) * (num classes - 1)
+    p <- (length(selected_vars) + 1) * (length(levels(y)) - 1)
+    bic_value <- -(-2 * as.numeric(ll) + log(n) * p)
+  }
+  
+  if (full_res){
+    return(list(BIC = bic_value, 
+                selected_variables = selected_vars, 
+                model = fit))
+  }
+  else {
+    return(BIC = bic_value)
+  }
+}
+
+
+clvarselgrbkw_mixall_parallel <- function(X, G = 2:9, strategy = clusterStrategy(),
+                                        samp = FALSE, sampsize = 2000,
+                                        BIC.diff = 0, itermax = 100,
+                                        verbose = interactive(),
+                                        num_cores = parallel::detectCores() - 1)
+{
+  require(parallel)
+  
+  # Convert X to a data frame if it's not already
+  X <- as.data.frame(X)
+  n <- nrow(X)
+  d <- ncol(X)
+  if(is.null(colnames(X))) 
+    colnames(X) <- paste("X", 1:d, sep = "")
+  G <- setdiff(G, 1)
+  
+  # If needed, sample the subset of observations
+  if(samp) { sub <- sample(1:n, min(sampsize,n), replace = FALSE) }
+  else     { sub <- seq.int(1,n) }
+
+  # Function to determine data type
+  get_data_type <- function(col) {
+    if (is.numeric(col) && all(col %% 1 == 0, na.rm = TRUE)) {
+      return("poisson")
+    } else if (is.factor(col) || is.character(col)) {
+      return("categorical")
+    } else {
+      return("gaussian")
+    }
+  }
+
+  # Prepare data and determine clustering function
+  prepare_data_and_cluster_function <- function(data) {
+    data_types <- sapply(data, get_data_type)
+    unique_types <- unique(data_types)
+    
+    if (length(unique_types) == 1) {
+      cluster_fun <- switch(unique_types,
+                          "poisson" = clusterPoisson,
+                          "categorical" = clusterCategorical,
+                          "gaussian" = clusterDiagGaussian)
+      models <- lapply(unique_types, function(type) {
+        switch(type,
+               "poisson" = "poisson_pk_ljk",
+               "categorical" = "categorical_pk_pjk",
+               "gaussian" = "gaussian_pk_sjk")
+      })
+      return(list(data = data, models = models[[1]], 
+                 cluster_fun = cluster_fun, is_mixed = FALSE))
+    } else {
+      data_list <- lapply(unique_types, function(type) {
+        data[, data_types == type, drop = FALSE]
+      })
+      models <- lapply(unique_types, function(type) {
+        switch(type,
+               "poisson" = "poisson_pk_ljk",
+               "categorical" = "categorical_pk_pjk",
+               "gaussian" = "gaussian_pk_sjk")
+      })
+      return(list(data = data_list, models = models, 
+                 cluster_fun = clusterMixedData, 
+                 is_mixed = TRUE))
+    }
+  }
+
+  # Function to fit clustering model
+  fit_cluster_model <- function(data, G) {
+    tryCatch({
+      prepared <- prepare_data_and_cluster_function(data)
+      if (prepared$is_mixed) {
+        model <- prepared$cluster_fun(prepared$data, nbCluster = G, 
+                                    strategy = strategy, criterion = "BIC", 
+                                    models = prepared$models, nbCore = 0)
+      } else {
+        model <- prepared$cluster_fun(prepared$data, nbCluster = G, 
+                                    strategy = strategy, criterion = "BIC",
+                                    models = prepared$models, nbCore = 0)
+      }
+      return(list(model = model, BIC = -model@criterion, nbCluster = model@nbCluster))
+    }, error = function(e) {
+      return(list(model = NULL, BIC = -Inf, nbCluster = NA))
+    })
+  }
+
+  # Initialize cluster for parallel processing
+  cl <- makeCluster(num_cores)
+  on.exit(stopCluster(cl))
+  
+  # Load required packages on all worker nodes
+  clusterEvalQ(cl, {
+    library(MixAll)
+    library(BMA)
+    library(nnet)
+    library(mlogitBMA)
+    NULL
+  })
+  
+  # Export necessary functions and objects to the cluster
+  clusterExport(cl, c("prepare_data_and_cluster_function", "get_data_type", 
+                     "fit_cluster_model", "compute_bic_reg",
+                     "strategy"), envir = environment())
+
+  # Initialize variables
+  S <- X
+  NS <- data.frame(matrix(ncol = 0, nrow = nrow(X)))
+  info <- data.frame(Var = character(), BIC = numeric(), BICdiff = numeric(), 
+                    Step = character(), Decision = character(), 
+                    Model = character(), G = integer(), 
+                    stringsAsFactors = FALSE)
+
+  # Initial clustering
+  if (verbose) cat("Initialize model\n")
+  init_model <- fit_cluster_model(S, G)
+  BICS <- init_model$BIC
+
+  criterion <- 1
+  iter <- 0
+
+  while((criterion == 1) & (iter < itermax) & (ncol(S) > 1)) {
+    iter <- iter + 1
+    if(verbose) cat(paste("iter", iter, "\n"))
+
+    # Removing step - Parallel processing
+    if(verbose) cat("- removing step\n")
+    remove_results <- parLapply(cl, 1:ncol(S), function(i) {
+      S_minus_i <- S[, -i, drop = FALSE]
+      model_minus_i <- fit_cluster_model(S_minus_i, G)
+      
+      # Calculate BIC for regression of removed variable on remaining variables
+      fully_observed <- complete.cases(S_minus_i)
+      S_minus_i_obs <- S_minus_i[fully_observed, , drop = FALSE]
+      S_i_obs <- S[fully_observed, i, drop = FALSE]
+      BICreg <- compute_bic_reg(S_minus_i_obs, S_i_obs,
+                               family = get_data_type(S[, i]))
+      
+      list(BIC_total = model_minus_i$BIC + BICreg, 
+           BICreg = BICreg,
+           model = model_minus_i$model, 
+           nbCluster = model_minus_i$nbCluster)
+    })
+    
+    BIC_remove <- sapply(remove_results, function(x) x$BIC_total)
+    BIC_reg <- sapply(remove_results, function(x) x$BICreg)
+    cdiff_remove <- BICS - BIC_remove
+    m_remove <- min(cdiff_remove)
+    arg_remove <- which.min(cdiff_remove)
+
+    if(m_remove < BIC.diff) {
+      # Remove variable
+      removed_var <- colnames(S)[arg_remove]
+      BICS <- BICS - BIC_reg[arg_remove] - cdiff_remove[arg_remove]
+      info <- rbind(info, data.frame(
+        Var = removed_var, BIC = BICS, BICdiff = m_remove,
+        Step = "Remove", Decision = "Accepted",
+        Model = class(remove_results[[arg_remove]]$model)[1],
+        G = remove_results[[arg_remove]]$nbCluster,
+        stringsAsFactors = FALSE
+      ))
+      NS[[removed_var]] <- S[[removed_var]]
+      S <- S[, -arg_remove, drop = FALSE]
+    } else {
+      info <- rbind(info, data.frame(
+        Var = colnames(S)[arg_remove], BIC = BICS, BICdiff = m_remove,
+        Step = "Remove", Decision = "Rejected",
+        Model = class(remove_results[[arg_remove]]$model)[1],
+        G = remove_results[[arg_remove]]$nbCluster,
+        stringsAsFactors = FALSE
+      ))
+    }
+
+    # Adding step - Parallel processing
+    if(ncol(NS) > 2) {
+      if(verbose) cat("+ adding step\n")
+      add_results <- parLapply(cl, 1:ncol(NS), function(i) {
+        S_plus_i <- cbind(S, NS[, i, drop = FALSE])
+        model_plus_i <- fit_cluster_model(S_plus_i, G)
+        
+        # Calculate BIC for regression of added variable on current variables
+        fully_observed <- complete.cases(S)
+        S_obs <- S[fully_observed, , drop = FALSE]
+        NS_i_obs <- NS[fully_observed, i, drop = FALSE]
+        BICreg <- compute_bic_reg(S_obs, NS_i_obs, 
+                                 family = get_data_type(S_obs))
+        
+        list(BIC_total = model_plus_i$BIC,
+             BICreg = BICreg,
+             model = model_plus_i$model,
+             nbCluster = model_plus_i$nbCluster)
+      })
+
+      BIC_add <- sapply(add_results, function(x) x$BIC_total)
+      BIC_reg <- sapply(add_results, function(x) x$BICreg)
+      cdiff_add <- BIC_add - (BICS + BIC_reg)
+      m_add <- max(cdiff_add)
+      arg_add <- which.max(cdiff_add)
+
+      if(m_add > BIC.diff) {
+        # Add variable to S and update clustering BICS
+        added_var <- colnames(NS)[arg_add]
+        BICS <- BIC_add[arg_add]
+        info <- rbind(info, data.frame(
+          Var = added_var, BIC = BICS, BICdiff = m_add,
+          Step = "Add", Decision = "Accepted",
+          Model = class(add_results[[arg_add]]$model)[1],
+          G = add_results[[arg_add]]$nbCluster,
+          stringsAsFactors = FALSE
+        ))
+        S[[added_var]] <- NS[[added_var]]
+        NS <- NS[, -arg_add, drop = FALSE]
+      } else {
+        info <- rbind(info, data.frame(
+          Var = colnames(NS)[arg_add], BIC = BIC_add[arg_add], BICdiff = m_add,
+          Step = "Add", Decision = "Rejected",
+          Model = class(add_results[[arg_add]]$model)[1],
+          G = add_results[[arg_add]]$nbCluster,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+
+    if(verbose) {
+      print(info[nrow(info), c("Var", "BICdiff", "Step", "Decision")])
+    }
+
+    # Check if the variables in S have changed
+    criterion <- if(ncol(S) == 0) 0 else 1
+  }
+
+  if(iter >= itermax) 
+    warning("Algorithm stopped because maximum number of iterations was reached")
+
+  # Prepare output
+  varnames <- colnames(X)
+  subset <- if(ncol(S) == 0) NULL else match(colnames(S), varnames)
+
+  # Fit final model to get optimal number of clusters
+  final_model <- fit_cluster_model(S, G)
+  optimal_G <- final_model$nbCluster
+
+  out <- list(
+    variables = varnames,
+    subset = subset,
+    cluster_model = final_model,
+    steps.info = info,
+    optimal_G = optimal_G,
+    search = "greedy",
+    direction = "backward"
+  )
+  class(out) <- "clustvarsel_mixall"
+  return(out)
+}
+
+```
+
+# Example: Mclust vs MixAll
+```{r}
+# Generate data
+# x <- generate_data()
+
+# Function to create 2D rotation matrix
+rotation_matrix_2d <- function(angle) {
+  matrix(c(cos(angle), -sin(angle),
+           sin(angle), cos(angle)), nrow = 2)
+}
+
+# Function to create 3D rotation matrix
+rotation_matrix_3d <- function(axis, angle) {
+  if (axis == "z") {
+    matrix(c(cos(angle), -sin(angle), 0,
+             sin(angle), cos(angle), 0,
+             0, 0, 1), nrow = 3)
+  } else if (axis == "x") {
+    matrix(c(1, 0, 0,
+             0, cos(angle), -sin(angle),
+             0, sin(angle), cos(angle)), nrow = 3)
+  }
+}
+
+set.seed(123)
+
+# Parameters
+n <- 2000
+p <- c(0.25, 0.25, 0.2, 0.3)
+mu <- rbind(c(0, 0, 0),
+            c(-6, 6, 0),
+            c(0, 0, 6),
+            c(-6, 6, 6))
+
+# Create covariance matrix
+A <- rotation_matrix_3d("z", pi/6) %*% rotation_matrix_3d("x", pi/3)
+Sigma <- A %*% diag(c(6*sqrt(2), 1, 2)) %*% t(A)
+diag_vals <- diag(Sigma)
+Sigma <- diag(x = diag_vals)
+
+# Generate mixture data
+component <- sample(1:4, n, replace = TRUE, prob = p)
+X <- matrix(0, nrow = n, ncol = 3)
+for (k in 1:4) {
+  idx <- which(component == k)
+  X[idx,] <- mvrnorm(length(idx), mu = mu[k,], Sigma = Sigma)
+}
+
+# Generate fourth and fifth variables
+epsilon <- mvrnorm(n, mu = c(0, 0), Sigma = rotation_matrix_2d(pi/6) %*% diag(c(1, 3)) %*% t(rotation_matrix_2d(pi/6)))
+Y45 <- cbind(X[,1:2] %*% matrix(c(0.5, 1, 2, 0), nrow = 2) + epsilon + c(-1, 2))
+
+# Generate two noisy variables
+noise <- matrix(rnorm(n*2), ncol = 2)
+
+# Combine all variables
+data <- cbind(X, Y45, noise)
+colnames(data) <- paste0("V", 1:7)
+
+data_missing <- produce_NA(data, mechanism = "MAR",
+                           perc.missing = 0.2)$data.incomp
+
+# MixAll clustering
+mixall_model <- clusterDiagGaussian(data = data_missing, nbCluster = 2:4, 
+                                    strategy = clusterStrategy(
+                                                nbTry = 15,
+                                                nbInit = 25,
+                                                initMethod = "class",
+                                                initAlgo = "SEM",
+                                                nbInitIteration = 50,
+                                                initEpsilon = 1e-3,
+                                                nbShortRun = 10,
+                                                shortRunAlgo = "EM",
+                                                nbShortIteration = 100,
+                                                shortEpsilon = 1e-05,
+                                                longRunAlgo = "EM",
+                                                nbLongIteration = 1000,
+                                                longEpsilon = 1e-05),
+                                    models=c("gaussian_pk_sjk"))
+
+mixall_model@criterion
+imputed_values <- missingValues(mixall_model)
+# Function to compute error metrics
+compute_error_metrics <- function(actual, predicted) {
+  # Mean Squared Error
+  mse <- mean((actual - predicted)^2)
+  
+  # Root Mean Square Error
+  rmse <- sqrt(mse)
+  
+  # Normalized Root Mean Square Error
+  nrmse <- rmse / sqrt(mean(actual^2))
+  
+  return(list(
+    mse = mse,
+    rmse = rmse,
+    nrmse = nrmse
+  ))
+}
+
+create_imputation_comparison <- function(data, imputed_values) {
+  if (!is.data.frame(imputed_values)) {
+    imputed_values <- as.data.frame(imputed_values)
+  }
+  
+  # Initialize results dataframe
+  comparison_df <- data.frame(
+    row = imputed_values$row,
+    col = imputed_values$col,
+    actual_value = NA,
+    imputed_value = imputed_values$value,
+    abs_difference = NA
+  )
+  
+  for (i in 1:nrow(comparison_df)) {
+    row_idx <- comparison_df$row[i]
+    col_idx <- comparison_df$col[i]
+    actual_val <- data[row_idx, col_idx]
+    comparison_df$actual_value[i] <- actual_val
+    comparison_df$abs_difference[i] <- abs(actual_val - comparison_df$imputed_value[i])
+  }
+  
+  error_metrics <- compute_error_metrics(comparison_df$actual_value, comparison_df$imputed_value)
+  
+  attr(comparison_df, "mse") <- error_metrics$mse
+  attr(comparison_df, "rmse") <- error_metrics$rmse
+  attr(comparison_df, "nrmse") <- error_metrics$nrmse
+  attr(comparison_df, "mean_abs_diff") <- mean(comparison_df$abs_difference)
+  attr(comparison_df, "max_abs_diff") <- max(comparison_df$abs_difference)
+  
+  return(comparison_df)
+}
+
+comparison_results <- create_imputation_comparison(data, imputed_values)
+
+print("Imputation Comparison Results:")
+print(comparison_results)
+print("\nError Metrics:")
+print(sprintf("MSE (Mean Squared Error): %f", attr(comparison_results, "mse")))
+print(sprintf("RMSE (Root Mean Square Error): %f", attr(comparison_results, "rmse")))
+print(sprintf("NRMSE (Normalized RMSE): %f", attr(comparison_results, "nrmse")))
+print(sprintf("Mean Absolute Difference: %f", attr(comparison_results, "mean_abs_diff")))
+print(sprintf("Maximum Absolute Difference: %f", attr(comparison_results, "max_abs_diff")))
+
+error_summary <- data.frame(
+  Metric = c("MSE", "RMSE", "NRMSE", "Mean Abs Diff", "Max Abs Diff"),
+  Value = c(
+    attr(comparison_results, "mse"),
+    attr(comparison_results, "rmse"),
+    attr(comparison_results, "nrmse"),
+    attr(comparison_results, "mean_abs_diff"),
+    attr(comparison_results, "max_abs_diff")
+  )
+)
+print("\nError Metrics Summary:")
+print(error_summary)
+
+# Mclust clustering
+mclust_model <- Mclust(data, G = 2:4, modelNames = "VVI")
+
+mclust_model$BIC
+
+
+
+# Compare optimal number of clusters
+cat("Optimal number of clusters:\n")
+cat("MixAll:", mixall_model@nbCluster, "\n")
+cat("Mclust:", mclust_model$G, "\n")
+
+# Compare clustering results
+mixall_clusters <- mixall_model@ziFit
+mclust_clusters <- mclust_model$classification
+
+# Calculate Adjusted Rand Index
+ari <- adjustedRandIndex(mixall_clusters, mclust_clusters)
+cat("Adjusted Rand Index between MixAll and Mclust clusterings:", ari, "\n")
+```
+
+# Example: BIC regression computation
+```{r}
+BICreg2 <- function(x, y, family = "gaussian", full_res = FALSE) {
+  # Ensure required packages are loaded
+  required_packages <- c("BMA", "nnet", "mlogitBMA")
+  for (pkg in required_packages) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      stop(paste("Package", pkg, 
+                 "is required but not installed. Please install it."))
+    }
+  }
+  
+  x <- as.matrix(x)
+  
+  if (family != "multinomial") {
+    y <- as.vector(y)
+  } else {
+    y <- as.factor(y)
+  }
+  
+  n <- length(y)
+  
+  # Initialize variables
+  selected_vars <- NULL
+  bic_value <- NA
+  fit <- NULL
+  
+  if (family != "multinomial") {
+    bic_model <- BMA::bic.glm(x, y, glm.family = family, 
+                             strict = FALSE, nbest = 1)
+    
+    # Select the best model
+    best_model <- bic_model$which[1, ]
+    selected_vars <- which(best_model)
+  
+    # Fit on selected vars
+    if (family == "gaussian") {
+      fit <- lm(y ~ ., data = data.frame(y = y, 
+                                         x = x[, selected_vars, drop = FALSE]))
+      sigma <- sqrt(mean(residuals(fit)^2))
+      p <- n - df.residual(fit) + 1
+      bic_ref <- -n*log(2*pi) - 2*n*log(sigma) - n - log(n)*p
+    } else if (family == "poisson") {
+      fit <- glm(y ~ ., data = data.frame(y = y, 
+                                          x = x[, selected_vars, drop = FALSE]),
+                 family = poisson())
+      mu <- fitted(fit)
+      ll <- sum(dpois(y, mu, log = TRUE))
+      p <- length(selected_vars) + 1
+      
+      # BIC = -2*log-likelihood + log(n)*p
+      bic_ref <- 2*ll - log(n)*p
+    }
+    
+    # Compute BIC
+    bic_value <- -BIC(fit)
+    cat("Difference in BIC: ", abs(bic_value - bic_ref))
+    
+  } else {
+    data_df <- as.data.frame(cbind(y, x))
+    names(data_df)[1] <- "y"
+    
+    f_mnl <- as.formula(paste("y ~", paste(colnames(x), collapse = " + ")))
+    
+    # Perform BMA for Multinomial Logistic Regression
+    bic_model <- tryCatch({
+      bic.mlogit(f = f_mnl, data = data_df, 
+                 base.choice = 1, varying = NULL, sep = ".", 
+                 approx = TRUE, include.intercepts = TRUE, nbest = 1)
+    }, error = function(e) {
+      stop("Error in bic.mlogit: ", e$message)
+    })
+    
+    # Extract the selected variables
+    selected_models <- bic_model$bic.glm$which
+    selected_vars <- which(selected_models)
+  
+    f_sel <- as.formula(paste("y ~", 
+                              paste(colnames(x)[selected_vars], 
+                                    collapse = " + ")))
+    
+    fit <- tryCatch({
+      nnet::multinom(f_sel, data = data_df, trace = FALSE)
+    }, error = function(e) {
+      stop("Error in fitting multinomial model: ", e$message)
+    })
+    
+    # Compute BIC for the multinomial model
+    ll <- logLik(fit)
+    # Number of parameters: (num preds + intercept) * (num classes - 1)
+    p <- (length(selected_vars) + 1) * (length(levels(y)) - 1)
+    bic_value <- -(-2 * as.numeric(ll) + log(n) * p)
+  }
+  if (full_res){return(list(BIC = bic_value, 
+                            selected_variables = selected_vars, 
+                            model = fit))}
+  else {return(BIC = bic_value)}
+}
+
+BICreg <- function(x, y)
+{
+  x <- as.matrix(x)
+  y <- as.vector(y)
+  n <- length(y)
+  mod <- bicreg(y = y, x = x, nbest = 1)
+  subset <- which(mod$which[1,])
+  mod <- lm.fit(y = y, x = cbind(1,x[,subset]))
+  # calculate the BIC for the regression
+  sigma <- sqrt(mean(residuals(mod)^2))
+  p <- n - df.residual(mod) + 1
+  -n*log(2*pi) -2*n*log(sigma) -n -log(n)*p
+}
+
+#####################
+# Gaussian data
+#####################
+
+n <- 100
+p <- 10   
+
+x <- matrix(rnorm(n * p), nrow = n, ncol = p)
+colnames(x) <- paste0("X", 1:p)
+
+true_coef <- c(3, -2, 1.5, rep(0, p - 3))
+
+sigma <- 1
+y <- x %*% true_coef + rnorm(n, mean = 0, sd = sigma)
+y <- as.vector(y)
+
+bic_reg_value <- BICreg(x, y)
+print(paste("BICreg BIC:", bic_reg_value))
+
+bic_reg2_result <- BICreg2(x, y, family = "gaussian", full_res = T)
+print(paste("BICreg2 BIC:", bic_reg2_result$BIC))
+
+selected_vars_bicreg <- which(bicreg(y = y, x = x, nbest = 1)$which[1, ])
+selected_vars_bicreg2 <- bic_reg2_result$selected_variables
+
+print("Selected variables by BICreg:")
+print(colnames(x)[selected_vars_bicreg])
+
+print("Selected variables by BICreg2:")
+print(colnames(x)[selected_vars_bicreg2])
+
+#####################
+# Poisson data
+#####################
+
+n_poisson <- 200
+p_poisson <- 15   
+
+x_poisson <- matrix(rnorm(n_poisson * p_poisson), nrow = n_poisson, ncol = p_poisson)
+colnames(x_poisson) <- paste0("X", 1:p_poisson)
+
+# Only the first 5 preds are relevant
+true_coef_poisson <- c(0.8, -1.2, 0.5, 0, 0, rep(0, p_poisson - 5))
+
+log_lambda <- x_poisson %*% true_coef_poisson
+lambda <- exp(log_lambda)
+
+y_poisson <- rpois(n_poisson, lambda = lambda)
+
+bic_reg2_poisson_result <- BICreg2(x_poisson, y_poisson, family = "poisson", 
+                                   full_res = T)
+print(paste("BICreg2 (Poisson) BIC:", round(bic_reg2_poisson_result$BIC, 2)))
+
+selected_vars_poisson <- bic_reg2_poisson_result$selected_variables
+print("Selected variables by BICreg2 (Poisson):")
+print(colnames(x_poisson)[selected_vars_poisson])
+
+#####################
+# Multinomial data
+#####################
+
+set.seed(123)
+n_multinom <- 300  # Num observations
+p_multinom <- 20    # Num predictors
+k_multinom <- 3     # Num classes
+
+x_multinom <- matrix(rnorm(n_multinom * p_multinom), nrow = n_multinom, ncol = p_multinom)
+colnames(x_multinom) <- paste0("X", 1:p_multinom)
+
+beta1 <- c(1.5, -2, 0.5, rep(0, p_multinom - 3))
+
+beta2 <- c(-1, 2.5, -0.7, rep(0, p_multinom - 3))
+
+# Compute linear predictors
+eta1 <- x_multinom %*% beta1
+eta2 <- x_multinom %*% beta2
+eta3 <- 0  # Reference class
+
+# Compute probs with softmax
+exp_eta1 <- exp(eta1)
+exp_eta2 <- exp(eta2)
+exp_eta3 <- exp(eta3)
+
+prob1 <- exp_eta1 / (exp_eta1 + exp_eta2 + exp_eta3)
+prob2 <- exp_eta2 / (exp_eta1 + exp_eta2 + exp_eta3)
+prob3 <- exp_eta3 / (exp_eta1 + exp_eta2 + exp_eta3)
+
+# Assign classes 
+y_multinom <- vector(length = n_multinom)
+for (i in 1:n_multinom) {
+  y_multinom[i] <- sample(1:k_multinom, size = 1, prob = c(prob1[i], prob2[i], prob3[i]))
+}
+y_multinom <- as.factor(y_multinom)
+levels(y_multinom) <- paste0("Class", 1:k_multinom)
+table(y_multinom)
+
+bic_reg2_multinom_result <- BICreg2(x_multinom, y_multinom, 
+                                    family = "multinomial",
+                                    full_res = T)
+
+print(paste("BICreg2 (Multinomial) BIC:", round(bic_reg2_multinom_result$BIC, 2)))
+
+selected_vars_multinom <- bic_reg2_multinom_result$selected_variables
+print("Selected variables by BICreg2 (Multinomial):")
+print(colnames(x_multinom)[selected_vars_multinom])
+
+```
+
+
+# Example: Poisson with gaussian linear 
+## Redefine function
+```{r}
+clvarselgrbkw_mixall_gauss <- function(X, G = 2:9, strategy = clusterStrategy(),
+                                 samp = FALSE, sampsize = 2000,
+                                 BIC.diff = 0, itermax = 100,
+                                 verbose = interactive())
+{
+  # Convert X to a data frame if it's not already
+  X <- as.data.frame(X)
+  n <- nrow(X) # number of rows = number of observations
+  d <- ncol(X) # number of columns = number of variables
+  if(is.null(colnames(X))) 
+    colnames(X) <- paste("X", 1:d, sep = "")
+  G <- setdiff(G, 1)
+  
+  # If needed, sample the subset of observations
+  if(samp) { sub <- sample(1:n, min(sampsize,n), replace = FALSE) }
+  else     { sub <- seq.int(1,n) }
+
+  # Function to determine data type
+  get_data_type <- function(col) {
+    if (is.numeric(col) && all(col %% 1 == 0, na.rm = TRUE)) {
+      return("poisson")
+    } else if (is.factor(col) || is.character(col)) {
+      return("categorical")
+    } else {
+      return("gaussian")
+    }
+  }
+
+  # Prepare data and determine clustering function
+  prepare_data_and_cluster_function <- function(data) {
+    data_types <- sapply(data, get_data_type)
+    unique_types <- unique(data_types)
+    
+    if (length(unique_types) == 1) {
+      # Single data type
+      cluster_fun <- switch(unique_types,
+                            "poisson" = clusterPoisson,
+                            "categorical" = clusterCategorical,
+                            "gaussian" = clusterDiagGaussian)
+      models <- lapply(unique_types, function(type) {
+        switch(type,
+               "poisson" = "poisson_pk_ljk",
+               "categorical" = "categorical_pk_pjk",
+               "gaussian" = "gaussian_pk_sjk")
+      })
+      return(list(data = data, models = models[[1]], 
+                  cluster_fun = cluster_fun, is_mixed = FALSE))
+    } else {
+      # Mixed data types
+      data_list <- lapply(unique_types, function(type) {
+        data[, data_types == type, drop = FALSE]
+      })
+      models <- lapply(unique_types, function(type) {
+        switch(type,
+               "poisson" = "poisson_pk_ljk",
+               "categorical" = "categorical_pk_pjk",
+               "gaussian" = "gaussian_pk_sjk")
+      })
+      return(list(data = data_list, models = models, 
+                  cluster_fun = clusterMixedData, 
+                  is_mixed = TRUE))
+    }
+  }
+
+  # Function to fit clustering model
+  fit_cluster_model <- function(data, G) {
+    tryCatch({
+      prepared <- prepare_data_and_cluster_function(data)
+      if (prepared$is_mixed) {
+        model <- prepared$cluster_fun(prepared$data, nbCluster = G, 
+                                      strategy = strategy, 
+                                      criterion="BIC",
+                                      models = prepared$models,
+                                      nbCore = 0)
+      } else {
+        model <- prepared$cluster_fun(prepared$data, nbCluster = G, 
+                                      strategy = strategy,
+                                      criterion="BIC",
+                                      models=prepared$models,
+                                      nbCore = 0)
+      }
+      return(list(model = model, BIC = -model@criterion))
+    }, error = function(e) {
+      return(list(model = NULL, BIC = -Inf))
+    })
+  }
+
+  # Initialize variables
+  S <- X
+  NS <- data.frame(matrix(ncol = 0, nrow = nrow(X)))
+  info <- data.frame(Var = character(), BIC = numeric(), BICdiff = numeric(), 
+                     Step = character(), Decision = character(), 
+                     Model = character(), G = integer(), 
+                     stringsAsFactors = FALSE)
+
+  # Initial clustering
+  if (verbose) cat("Initialize model\n")
+  init_model <- fit_cluster_model(S, G)
+  BICS <- init_model$BIC
+
+  criterion <- 1
+  iter <- 0
+
+  while((criterion == 1) & (iter < itermax) & (ncol(S) > 1)) {
+    iter <- iter + 1
+    if(verbose) cat(paste("iter", iter, "\n"))
+
+    # Removing step
+    if(verbose) cat("- removing step\n")
+    remove_results <- lapply(1:ncol(S), function(i) {
+      S_minus_i <- S[, -i, drop = FALSE]
+      model_minus_i <- fit_cluster_model(S_minus_i, G)
+      
+      # Calculate BIC for regression of removed variable on remaining variables
+      # Ensure R (S_minus_i) is fully observed for BIC regression
+      fully_observed <- complete.cases(S_minus_i)
+      S_minus_i_obs <- S_minus_i[fully_observed, , drop = FALSE]
+      S_i_obs <- S[fully_observed, i, drop = FALSE]
+      BICreg <- compute_bic_reg(S_minus_i_obs,S_i_obs,
+                                family = "gaussian")
+      
+      return(list(BICnotclust = model_minus_i$BIC+BICreg, BICreg=BICreg, 
+                  model = model_minus_i$model))
+    })
+    BIC_remove <- sapply(remove_results, function(x) x$BICnotclust)
+    BIC_reg <- sapply(remove_results, function(x) x$BICreg)
+    
+    cdiff_remove <- BICS - BIC_remove
+    m_remove <- min(cdiff_remove)
+    arg_remove <- which.min(cdiff_remove)
+
+    if(m_remove < BIC.diff) {
+      # Remove variable
+      removed_var <- colnames(S)[arg_remove]
+      
+      # Check this part 
+      BICS <- BICS - BIC_reg[arg_remove] - cdiff_remove[arg_remove]
+      info <- rbind(info, data.frame(
+        Var = removed_var, BIC = BICS, BICdiff = m_remove,
+        Step = "Remove", Decision = "Accepted",
+        Model = class(remove_results[[arg_remove]]$model)[1],
+        G = remove_results[[arg_remove]]$model@nbCluster,
+        stringsAsFactors = FALSE
+      ))
+      NS[[removed_var]] <- S[[removed_var]]
+      S <- S[, -arg_remove, drop = FALSE]
+    } else {
+      info <- rbind(info, data.frame(
+        Var = colnames(S)[arg_remove], BIC = BICS, BICdiff = m_remove,
+        Step = "Remove", Decision = "Rejected",
+        Model = class(remove_results[[arg_remove]]$model)[1],
+        G = remove_results[[arg_remove]]$model@nbCluster,
+        stringsAsFactors = FALSE
+      ))
+    }
+
+    # Adding step
+    # Check ncol(NS) > 0 or > 2 !!!
+    if(ncol(NS) > 2) {
+      if(verbose) cat("+ adding step\n")
+      add_results <- lapply(1:ncol(NS), function(i) {
+        S_plus_i <- cbind(S, NS[, i, drop = FALSE])
+        model_plus_i <- fit_cluster_model(S_plus_i, G)
+        
+        # Calculate BIC for regression of added variable on current variables
+        # Ensure R (S) is fully observed for BIC regression
+        fully_observed <- complete.cases(S)
+        S_obs <- S[fully_observed, , drop = FALSE]
+        NS_i_obs <- NS[fully_observed, i, drop = FALSE]
+        if (nrow(S_obs) != nrow(NS_i_obs)) {
+          stop(paste("After subsetting, S_obs has", nrow(S_obs), 
+                 "rows but NS_i_obs has", nrow(NS_i_obs), "elements"))}
+        BICreg <- compute_bic_reg(S_obs, NS_i_obs, family = "gaussian")
+        
+        return(list(BIC = model_plus_i$BIC, BICreg = BICreg, 
+                    model = model_plus_i$model))
+      })
+
+      BIC_add <- sapply(add_results, function(x) x$BIC)
+      BIC_reg <- sapply(add_results, function(x) x$BICreg)
+      cdiff_add <- BIC_add - (BICS + BIC_reg)
+      m_add <- max(cdiff_add)
+      arg_add <- which.max(cdiff_add)
+
+      if(m_add > BIC.diff) {
+        # Add variable
+        added_var <- colnames(NS)[arg_add]
+        BICS <- BIC_add[arg_add]
+        info <- rbind(info, data.frame(
+          Var = added_var, BIC = BICS, BICdiff = m_add,
+          Step = "Add", Decision = "Accepted",
+          Model = class(add_results[[arg_add]]$model)[1],
+          G = add_results[[arg_add]]$model@nbCluster,
+          stringsAsFactors = FALSE
+        ))
+        S[[added_var]] <- NS[[added_var]]
+        NS <- NS[, -arg_add, drop = FALSE]
+      } else {
+        info <- rbind(info, data.frame(
+          Var = colnames(NS)[arg_add], BIC = BIC_add[arg_add], BICdiff = m_add,
+          Step = "Add", Decision = "Rejected",
+          Model = class(add_results[[arg_add]]$model)[1],
+          G = add_results[[arg_add]]$model@nbCluster,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+
+    if(verbose) {
+      print(info[nrow(info), c("Var", "BICdiff", "Step", "Decision")])
+    }
+
+    # Check if the variables in S have changed
+    criterion <- if(ncol(S) == 0) 0 else 1
+  }
+
+  if(iter >= itermax) 
+    warning("Algorithm stopped because maximum number of iterations was reached")
+
+  # Prepare output
+  varnames <- colnames(X)
+  subset <- if(ncol(S) == 0) NULL else match(colnames(S), varnames)
+
+  out <- list(variables = varnames,
+              subset = subset,
+              steps.info = info,
+              search = "greedy",
+              direction = "backward")
+  class(out) <- "clustvarsel"
+  return(out)
+}
+```
+
+## Run exp 
+```{r}
+set.seed(123)
+# 1. Experiment with Count Data
+generate_count_data <- function(n = 1000, d = 10, k = 3, missing = FALSE) {
+  relevant_vars <- paste0("X", 1:5)
+  irrelevant_vars <- paste0("X", 6:10)
+  
+  data <- data.frame(matrix(0, nrow = n, ncol = d))
+  names(data) <- c(relevant_vars, irrelevant_vars)
+  
+  cluster_sizes <- rep(n / k, k)
+  start_idx <- 1
+  for (i in 1:k) {
+    end_idx <- start_idx + cluster_sizes[i] - 1
+    # Relevant variables have cluster-specific means
+    data[start_idx:end_idx, relevant_vars] <- matrix(rpois(length(relevant_vars) * cluster_sizes[i], lambda = 3 + i), ncol = length(relevant_vars))
+    # Irrelevant variables have the same distribution across clusters
+    data[start_idx:end_idx, irrelevant_vars] <- matrix(rpois(length(irrelevant_vars) * cluster_sizes[i], lambda = 3), ncol = length(irrelevant_vars))
+    start_idx <- end_idx + 1
+  }
+  
+  if (missing) {
+    data <- introduce_missing(data)
+  }
+  return(data)
+}
+
+count_data <- generate_count_data(n = 300)
+
+EM_init <- clusterStrategy(nbTry = 5,
+                            nbInit = 10,
+                            initMethod = "class",
+                            initAlgo = "SEM",
+                            nbInitIteration = 25,
+                            initEpsilon = 1e-3,
+                            nbShortRun = 10,
+                            shortRunAlgo = "EM",
+                            nbShortIteration = 100,
+                            shortEpsilon = 1e-05,
+                            longRunAlgo = "EM",
+                            nbLongIteration = 1000,
+                            longEpsilon = 1e-05)
+
+
+
+count_result <- clvarselgrbkw_mixall_gauss(count_data, G = 3, 
+                                     strategy = EM_init, 
+                                     itermax = 7, verbose = TRUE)
+
+print("Count Data Results:")
+print(count_result$subset)
+print(count_result$steps.info)
+
+```
+
+
+# Example: Variable selection
+## Gaussian data (Maugis 5.1)
+```{r}
+# Function to create 2D rotation matrix
+rotation_matrix_2d <- function(angle) {
+  matrix(c(cos(angle), -sin(angle),
+           sin(angle), cos(angle)), nrow = 2)
+}
+
+# Function to create 3D rotation matrix
+rotation_matrix_3d <- function(axis, angle) {
+  if (axis == "z") {
+    matrix(c(cos(angle), -sin(angle), 0,
+             sin(angle), cos(angle), 0,
+             0, 0, 1), nrow = 3)
+  } else if (axis == "x") {
+    matrix(c(1, 0, 0,
+             0, cos(angle), -sin(angle),
+             0, sin(angle), cos(angle)), nrow = 3)
+  }
+}
+
+set.seed(123)
+
+# Parameters
+n <- 2000
+p <- c(0.25, 0.25, 0.2, 0.3)
+mu <- rbind(c(0, 0, 0),
+            c(-6, 6, 0),
+            c(0, 0, 6),
+            c(-6, 6, 6))
+
+# Create covariance matrix
+A <- rotation_matrix_3d("z", pi/6) %*% rotation_matrix_3d("x", pi/3)
+Sigma <- A %*% diag(c(6*sqrt(2), 1, 2)) %*% t(A)
+diag_vals <- diag(Sigma)
+Sigma <- diag(x = diag_vals)
+
+# Generate mixture data
+component <- sample(1:4, n, replace = TRUE, prob = p)
+X <- matrix(0, nrow = n, ncol = 3)
+for (k in 1:4) {
+  idx <- which(component == k)
+  X[idx,] <- mvrnorm(length(idx), mu = mu[k,], Sigma = Sigma)
+}
+
+# Generate fourth and fifth variables
+epsilon <- mvrnorm(n, mu = c(0, 0), Sigma = rotation_matrix_2d(pi/6) %*% diag(c(1, 3)) %*% t(rotation_matrix_2d(pi/6)))
+Y45 <- cbind(X[,1:2] %*% matrix(c(0.5, 1, 2, 0), nrow = 2) + epsilon + c(-1, 2))
+
+# Generate two noisy variables
+noise <- matrix(rnorm(n*2), ncol = 2)
+
+# Combine all variables
+data <- cbind(X, Y45, noise)
+colnames(data) <- paste0("V", 1:7)
+```
+
+### No Missing values
+```{r}
+## Run variable selection
+result <- clvarselgrbkw_mixall_parallel(data, G = 2:6, 
+                               strategy = clusterStrategy(
+                                                nbTry = 5,
+                                                nbInit = 10,
+                                                initMethod = "class",
+                                                initAlgo = "SEM",
+                                                nbInitIteration = 25,
+                                                initEpsilon = 1e-3,
+                                                nbShortRun = 10,
+                                                shortRunAlgo = "EM",
+                                                nbShortIteration = 100,
+                                                shortEpsilon = 1e-05,
+                                                longRunAlgo = "EM",
+                                                nbLongIteration = 1000,
+                                                longEpsilon = 1e-05),
+                               itermax = 5, verbose = TRUE)
+
+# Print results
+print("Variable Selection Results:")
+print(result$subset)
+print(result$steps.info)
+
+result2 <- clustvarsel(data, G=2:6, search="greedy",
+                       direction = "backward", emModels1 = "V", 
+                       emModels2 = "VVI", allow.EEE = FALSE, forcetwo = FALSE)
+
+# result3 <- VarSelCluster(data, gvals = 2:8, 
+#                          vbleSelec = TRUE, crit.varsel = "BIC", nbcores = 4)
+
+# Evaluate results
+true_relevant <- c(1, 2, 3)  # True relevant variables
+true_redundant <- c(4, 5)    # True redundant variables
+true_noise <- c(6, 7)        # True noise variables
+
+selected_mixall<- result$subset
+selected_clustvarsel <- result2$subset
+# selected_varsellcm <- match(result3@model@names.relevant, colnames(data))
+
+# Selected variables
+print("Selected variables")
+print("Clustvarsel: ")
+print(selected_clustvarsel)
+
+print("Mixall: ")
+print(selected_mixall)
+
+# print("VarSelLCM: ")
+# print(selected_varsellcm)
+
+# Correctly identified relevant variables
+print("Correctly identified relevant variables")
+print("Clustvarsel: ")
+print(intersect(selected_clustvarsel, true_relevant))
+
+print("Mixall: ")
+print(intersect(selected_mixall, true_relevant))
+
+# print("VarSelLCM: ")
+# print(intersect(selected_varsellcm, true_relevant))
+
+# Correctly identified irrelevant variables
+print("Correctly identified irrelevant variables (redundant + noise)")
+print("Clustvarsel: ")
+print(setdiff(1:7, union(selected_clustvarsel, c(true_redundant, true_noise))))
+
+print("Mixall: ")
+print(setdiff(1:7, union(selected_mixall, c(true_redundant, true_noise))))
+
+# print("VarSelLCM: ")
+# print(setdiff(1:7, union(selected_varsellcm, c(true_redundant, true_noise))))
+
+# Misclassify variables
+print("Misclassified variables")
+print("Clustvarsel: ")
+print(setdiff(union(selected_clustvarsel, true_relevant), 
+              intersect(selected_clustvarsel, true_relevant)))
+
+print("Mixall: ")
+print(setdiff(union(selected_mixall, true_relevant), 
+              intersect(selected_mixall, true_relevant)))
+# 
+# print("VarSelLCM: ")
+# print(setdiff(union(selected_varsellcm, true_relevant), 
+#               intersect(selected_varsellcm, true_relevant)))
+
+```
+
+
+### Missing values
+```{r}
+# run analysis for a given missing rate
+run_analysis <- function(data, missing_rate) {
+  set.seed(123 + round(missing_rate * 100))  # Different seeds
+  
+  data_missing <- produce_NA(data, mechanism = "MAR",
+                             perc.missing = missing_rate)$data.incomp
+  # Run variable selection methods
+  result_mixall <- clvarselgrbkw_mixall_parallel(data_missing, G = 3:4, 
+                                           strategy = clusterStrategy(
+                                             nbTry = 10,
+                                             nbInit = 25,
+                                             initMethod = "class",
+                                             initAlgo = "SEM",
+                                             nbInitIteration = 50,
+                                             initEpsilon = 1e-3,
+                                             nbShortRun = 10,
+                                             shortRunAlgo = "EM",
+                                             nbShortIteration = 100,
+                                             shortEpsilon = 1e-05,
+                                             longRunAlgo = "EM",
+                                             nbLongIteration = 1000,
+                                             longEpsilon = 1e-05),
+                                             itermax = 8, 
+                                             verbose = TRUE)
+
+  # Extract results
+  selected_mixall <- if(inherits(result_mixall, "try-error")) NULL else result_mixall$subset
+  optimal_G <- result_mixall$optimal_G
+  cluster_model <- result_mixall$cluster_model
+  # Return results
+  return(list(
+    missing_rate = missing_rate,
+    mixall = selected_mixall,
+    G = optimal_G,
+    cluster_mod = cluster_model
+  ))
+}
+
+
+# Run analysis for different missing rates
+# missing_rates <- c(0, 0.05, 0.10, 0.15, 0.20)
+missing_rates <- c(0.05)
+results <- lapply(missing_rates, function(rate) run_analysis(data, rate))
+
+# Function to evaluate results
+evaluate_results <- function(selected_vars, 
+                             true_relevant = c(1, 2, 3),
+                           true_redundant = c(4, 5), 
+                           true_noise = c(6, 7)) {
+  if(is.null(selected_vars)) return(list(
+    correctly_identified = numeric(0),
+    misclassified = numeric(0)
+  ))
+  correctly_identified <- intersect(selected_vars, true_relevant)
+  misclassified <- setdiff(union(selected_vars, true_relevant),
+                          intersect(selected_vars, true_relevant))
+  
+  return(list(
+    correctly_identified = correctly_identified,
+    misclassified = misclassified
+  ))
+}
+
+# Print results for each missing rate
+for(i in seq_along(results)) {
+  cat(sprintf("\nResults for %d%% missing values:\n", results[[i]]$missing_rate * 100))
+  
+  # Evaluate each method
+  methods <- c("mixall")
+  for(method in methods) {
+    cat(sprintf("\n%s:\n", method))
+    eval_result <- evaluate_results(results[[i]][[method]])
+    cat("Num clusters:", 
+        paste(results[[i]][['G']], collapse = ", "), "\n")
+    cat("Correctly identified relevant variables:", 
+        paste(eval_result$correctly_identified, collapse = ", "), "\n")
+    cat("Misclassified variables:", 
+        paste(eval_result$misclassified, collapse = ", "), "\n")
+  }
+}
+
+
+
+
+
+```
+
+
+## Count data
+```{r}
+set.seed(123)
+
+# 1. Experiment with Count Data
+generate_count_data <- function(n = 1000, d = 10, k = 3, missing = FALSE) {
+  relevant_vars <- paste0("X", 1:5)
+  irrelevant_vars <- paste0("X", 6:10)
+  
+  data <- data.frame(matrix(0, nrow = n, ncol = d))
+  names(data) <- c(relevant_vars, irrelevant_vars)
+  
+  cluster_sizes <- rep(n / k, k)
+  start_idx <- 1
+  for (i in 1:k) {
+    end_idx <- start_idx + cluster_sizes[i] - 1
+    # Relevant variables have cluster-specific means
+    data[start_idx:end_idx, relevant_vars] <- matrix(rpois(length(relevant_vars) * cluster_sizes[i], lambda = 3 + i), ncol = length(relevant_vars))
+    # Irrelevant variables have the same distribution across clusters
+    data[start_idx:end_idx, irrelevant_vars] <- matrix(rpois(length(irrelevant_vars) * cluster_sizes[i], lambda = 3), ncol = length(irrelevant_vars))
+    start_idx <- end_idx + 1
+  }
+  
+  if (missing) {
+    data <- produce_NA(data)$data.incomp
+  }
+  return(data)
+}
+
+# Intialize EM
+EM_init <- clusterStrategy(nbTry = 10,
+                            nbInit = 25,
+                            initMethod = "class",
+                            initAlgo = "SEM",
+                            nbInitIteration = 50,
+                            initEpsilon = 1e-3,
+                            nbShortRun = 10,
+                            shortRunAlgo = "EM",
+                            nbShortIteration = 100,
+                            shortEpsilon = 1e-05,
+                            longRunAlgo = "EM",
+                            nbLongIteration = 1000,
+                            longEpsilon = 1e-05)
+
+# Without missing 
+count_data_wo_missing <- generate_count_data(n = 300)
+
+count_result_wo_missing <- clvarselgrbkw_mixall(count_data_wo_missing, G = 3, 
+                                     strategy = EM_init, 
+                                     itermax = 8, verbose = TRUE)
+
+print("Count Data w/o Missing Results:")
+print(count_result_wo_missing$subset)
+print(count_result_wo_missing$steps.info)
+
+# With missing 
+count_data_missing <- generate_count_data(n = 300, missing=TRUE)
+
+count_result_missing <- clvarselgrbkw_mixall(count_data_missing, G = 3, 
+                                     strategy = EM_init, 
+                                     itermax = 8 , verbose = TRUE)
+
+print("Count Data Missing Results:")
+print(count_result_missing$subset)
+print(count_result_missing$steps.info)
+```
+
+## Categorical and mixed data
+```{r}
+# # 2. Experiment with Categorical Data
+# generate_categorical_data <- function(n = 1000, d = 10, k = 3) {
+#   relevant_vars <- paste0("X", 1:5)
+#   irrelevant_vars <- paste0("X", 6:10)
+# 
+#   data <- as.data.frame(matrix(sample(1:4, n * d, replace = TRUE), nrow = n))
+#   names(data) <- c(relevant_vars, irrelevant_vars)
+# 
+#   # Make relevant variables cluster-specific
+#   for (i in 1:k) {
+#     cluster_indices <- ((i-1) * (n/k) + 1):(i * (n/k))
+#     data[cluster_indices, relevant_vars] <- data[cluster_indices, relevant_vars] + i
+#   }
+# 
+#   data[] <- lapply(data, factor)
+#   return(introduce_missing(data))
+# }
+# 
+# categorical_data <- generate_categorical_data()
+# categorical_result <- clvarselgrbkw_mixall(categorical_data, G = 2:4, 
+#                                            itermax = 10, verbose = TRUE)
+# 
+# print("Categorical Data Results:")
+# print(categorical_result$subset)
+# print(categorical_result$steps.info)
+# 
+# # 3. Experiment with Mixed Data
+# generate_mixed_data <- function(n = 1000, d = 15, k = 3) {
+#   relevant_count <- paste0("X", 1:3)
+#   relevant_categorical <- paste0("X", 4:6)
+#   relevant_continuous <- paste0("X", 7:9)
+#   irrelevant_vars <- paste0("X", 10:15)
+# 
+#   data <- as.data.frame(matrix(0, nrow = n, ncol = d))
+#   names(data) <- c(relevant_count, relevant_categorical, relevant_continuous, irrelevant_vars)
+# 
+#   # Generate data
+#   for (var in relevant_count) data[[var]] <- rpois(n, lambda = 3)
+#   for (var in relevant_categorical) data[[var]] <- factor(sample(1:4, n, replace = TRUE))
+#   for (var in relevant_continuous) data[[var]] <- rnorm(n)
+#   for (var in irrelevant_vars) {
+#     if (runif(1) > 0.5) {
+#       data[[var]] <- rpois(n, lambda = 3)
+#     } else {
+#       data[[var]] <- factor(sample(1:4, n, replace = TRUE))
+#     }
+#   }
+# 
+#   # Make relevant variables cluster-specific
+#   for (i in 1:k) {
+#     cluster_indices <- ((i-1) * (n/k) + 1):(i * (n/k))
+#     data[cluster_indices, relevant_count] <- data[cluster_indices, relevant_count] + i
+#     data[cluster_indices, relevant_categorical] <- factor(as.numeric(data[cluster_indices, relevant_categorical]) + i)
+#     data[cluster_indices, relevant_continuous] <- data[cluster_indices, relevant_continuous] + i
+#   }
+# 
+#   return(introduce_missing(data))
+# }
+# 
+# mixed_data <- generate_mixed_data()
+# mixed_result <- clvarselgrbkw_mixall(mixed_data, G = 2:4, 
+#                                      itermax = 10, verbose = TRUE)
+# 
+# print("Mixed Data Results:")
+# print(mixed_result$subset)
+# print(mixed_result$steps.info)
+```
+
+## Testing function 
+```{r}
+ # Function to determine data type
+  get_data_type <- function(col) {
+    if (is.numeric(col) && all(col %% 1 == 0, na.rm = TRUE)) {
+      return("poisson")
+    } else if (is.factor(col) || is.character(col)) {
+      return("categorical")
+    } else {
+      return("gaussian")
+    }
+  }
+
+  # Function to prepare data and determine clustering function
+  prepare_data_and_cluster_function <- function(data) {
+    data_types <- sapply(data, get_data_type)
+    unique_types <- unique(data_types)
+    
+    if (length(unique_types) == 1) {
+      # Single data type
+      cluster_fun <- switch(unique_types,
+                            "poisson" = clusterPoisson,
+                            "categorical" = clusterCategorical,
+                            "gaussian" = clusterDiagGaussian)
+      models <- lapply(unique_types, function(type) {
+        switch(type,
+               "poisson" = "poisson_pk_ljk",
+               "categorical" = "categorical_pk_pjk",
+               "gaussian" = "gaussian_pk_sjk")
+      })
+      return(list(data = data, models = models[[1]], 
+                  cluster_fun = cluster_fun, is_mixed = FALSE))
+    } else {
+      # Mixed data types
+      data_list <- lapply(unique_types, function(type) {
+        data[, data_types == type, drop = FALSE]
+      })
+      models <- lapply(unique_types, function(type) {
+        switch(type,
+               "poisson" = "poisson_pk_ljk",
+               "categorical" = "categorical_pk_pjk",
+               "gaussian" = "gaussian_pk_sjk")
+      })
+      return(list(data = data_list, models = models, 
+                  cluster_fun = clusterMixedData, is_mixed = TRUE))
+    }
+  }
+
+  # Function to fit clustering model
+  fit_cluster_model <- function(data, G) {
+    tryCatch({
+      prepared <- prepare_data_and_cluster_function(data)
+      if (prepared$is_mixed) {
+        model <- prepared$cluster_fun(prepared$data, nbCluster = G, 
+                                      strategy = clusterFastStrategy(), 
+                                      criterion = "BIC",
+                                      models = prepared$models,
+                                      nbCore=0)
+      } else {
+        model <- prepared$cluster_fun(prepared$data, nbCluster = G, strategy = 
+                                        clusterFastStrategy(),
+                                      criterion="BIC",
+                                      models=prepared$models,
+                                      nbCore=0)
+      }
+      return(list(model = model, BIC = model@criterion))
+    }, error = function(e) {
+      return(list(model = NULL, BIC = -Inf))
+    })
+  }
+
+prepared <- prepare_data_and_cluster_function(count_data)
+
+fit <- fit_cluster_model(prepared$data, G=2:4)
+#
+S <- count_data
+#
+G <- 2:4
+#
+
+remove_results <- lapply(1:ncol(S), function(i) {
+  S_minus_i <- S[, -i, drop = FALSE]
+  model_minus_i <- fit_cluster_model(S_minus_i, G)
+
+  # Calculate BIC for regression of removed variable on remaining variables
+  
+  BICreg <- compute_bic_reg(S_minus_i, S[, i], family = get_data_type(S[, i]))
+
+  return(list(BIC = model_minus_i$BIC + BICreg, model = model_minus_i$model))
+})
+# init_model <- fit_cluster_model(S, G)
+# BICS <- init_model$BIC
+# BIC_remove <- sapply(remove_results, function(x) x$BIC)
+# cdiff_remove <- BICS - BIC_remove
+# m_remove <- min(cdiff_remove)
+# arg_remove <- which.min(cdiff_remove)
+
+```
+
+# Example: MixAll
+```{r}
+# data(HeartDisease.cat)
+# data(HeartDisease.cont)
+# ldata <- list(HeartDisease.cat, HeartDisease.cont)
+# models = c("categorical_pk_pjk","gaussian_pk_sjk")
+# model <- clusterMixedData(ldata, models, nbCluster=2:5, strategy = clusterSEMStrategy(), criterion = "BIC")
+# 
+# summary(model)
+# missingValues(model)
+# print(model)
+```
+
