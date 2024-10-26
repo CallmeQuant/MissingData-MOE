@@ -1,3 +1,5 @@
+source("clustvarsel_mixall.R")
+source("exp_func.R")
 set.seed(123)
 
 # Parameters

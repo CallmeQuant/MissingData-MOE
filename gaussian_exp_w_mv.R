@@ -1,5 +1,6 @@
 source("clustvarsel_mixall.R")
 source("exp_func.R")
+source("amputation.R")
 # run analysis for given missing rate
 run_analysis <- function(data, missing_rate) {
   set.seed(123 + round(missing_rate * 100))

@@ -1,5 +1,6 @@
 source("clustvarsel_mixall.R")
 source("exp_func.R")
+source("amputation.R")
 set.seed(123)
 
 generate_count_data <- function(n = 1000, d = 10, k = 3, missing = FALSE) {
