@@ -288,7 +288,7 @@ clvarselgrbkw_mixall_parallel <- function(X,
     }
     
     # Adding step - Parallel processing
-    if(ncol(NS) > 0) {
+    if(ncol(NS) > 2) {
       if(verbose) cat("+ adding step\n")
       add_results <- parLapply(cl, 1:ncol(NS), function(i) {
         S_plus_i <- cbind(S, NS[, i, drop = FALSE])
@@ -310,8 +310,8 @@ clvarselgrbkw_mixall_parallel <- function(X,
       BIC_add <- sapply(add_results, function(x) x$BIC_total)
       BIC_reg <- sapply(add_results, function(x) x$BICreg)
       cdiff_add <- BIC_add - (BICS + BIC_reg)
-      m_add <- min(cdiff_add)
-      arg_add <- which.min(cdiff_add)
+      m_add <- max(cdiff_add)
+      arg_add <- which.max(cdiff_add)
       
       if(m_add > BIC.diff) {
         # Add variable
@@ -359,12 +359,13 @@ clvarselgrbkw_mixall_parallel <- function(X,
   out <- list(
     variables = varnames,
     subset = subset,
+    cluster_model = final_model,
     steps.info = info,
     optimal_G = optimal_G,
     search = "greedy",
     direction = "backward"
   )
-  class(out) <- "clustvarsel"
+  class(out) <- "clustvarsel_mixall"
   return(out)
 }
 
