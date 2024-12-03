@@ -1,0 +1,2230 @@
+---
+title: "SelvarClustMV"
+author: "Ho Huu Binh"
+date: "`r Sys.Date()`"
+toc: true
+format:
+  html: 
+    toc: true
+    toc_float: true
+    code: true
+    code-fold: true
+    code-tools: true
+  pdf: 
+    fontsize: "12"
+    toc: true
+    number-sections: true
+    number-depth: 3
+---
+
+## Loading libraries
+```{r, warning=F, message=F}
+library(here)
+library(Gmisc)
+library(glasso)
+library(MixAll)
+library(Rmixmod)
+library(MASS)
+library(mclust)
+library(clustvarsel)
+library(stats)
+library(VarSelLCM)
+library(BMA)
+library(mlogitBMA)
+library(mlogit)
+library(foreach)
+library(parallel)
+library(doParallel)
+library(iterators)
+library(reshape2)
+library(ggplot2)
+# library(SelvarMix)
+library(matrixStats)  # For efficient matrix operations
+
+rm(list=ls())
+source("amputation.R")
+
+# url <- "https://cran.r-project.org/src/contrib/Archive/SelvarMix/SelvarMix_1.2.1.tar.gz"
+# pkgFile <- "SelvarMix_1.2.1.tar.gz"
+# download.file(url=url, destfile = pkgFile)
+
+# source(pathJoin(here(), "SelvarMix/R/SortvarClust.R"))
+# source(pathJoin(here(), "SelvarMix/R/ClusteringEMGlasso.R"))
+# source(pathJoin(here(), "SelvarMix/src/rcppClusteringEMGlasso.cpp"))
+```
+
+
+## Initialize parameters
+```{r}
+InitParameter <- 
+  function(data, 
+           nbClust, 
+           n.start = 250, 
+           small.pen = 0.5)
+  { 
+    data <- as.matrix(scale(data, TRUE, FALSE))
+    n <- as.integer(dim(data)[1])
+    p <- as.integer(dim(data)[2])
+    n.start <- as.integer(n.start)
+    nbClust <- as.integer(nbClust)
+    small.pen <- as.double(small.pen)
+    
+    
+    Mu <- matrix(0, p, nbClust)
+    clust <- kmeans(data, nbClust, iter.max = 1e3, nstart = n.start, algorithm = c("Hartigan-Wong", "Lloyd", "Forgy", "MacQueen"))
+    memb <- clust$cluster
+    
+    S <- array(0, dim = c(p, p, nbClust))
+    for(k in 1:nbClust)
+    {
+      Mu[,k] <- colMeans(data[memb == k, , drop = FALSE])
+      S[,,k]  <- cov(data[memb == k, , drop = FALSE])
+    }
+    W <- Wi <- array(0, dim = c(p, p, nbClust))
+    for(k in 1:nbClust)
+    {
+      gg <- glasso(S[,,k], rho = small.pen,  thr=1e-4, maxit=1e4,  approx=FALSE, penalize.diagonal=FALSE, start=c("cold","warm"), w.init = NULL, wi.init=NULL, trace=FALSE) 
+      W[,,k] <- gg$w
+      Wi[,,k] <- gg$wi
+    }
+    
+    prop <- clust$size/n
+    P <- list()
+    P$X <-  data
+    P$prop <-  prop
+    P$Mu <-  Mu
+    P$CovarianceMatrix <- W
+    P$PrecisionMatrix <-  Wi
+    P$ProbCond <- matrix(0, nrow(data), nbClust)
+    return(P)
+  }
+```
+
+## Helper functions
+```{r}
+# Strategy settings for MixAll clustering
+quick_precise_strategy <- clusterStrategy(
+  nbTry = 10,
+  nbInit = 5,
+  initMethod = "class",
+  initAlgo = "SEM",
+  nbInitIteration = 5,
+  initEpsilon = 1e-4,
+  nbShortRun = 5,
+  shortRunAlgo = "EM",
+  nbShortIteration = 120,
+  shortEpsilon = 1e-6,
+  longRunAlgo = "EM",
+  nbLongIteration = 150,
+  longEpsilon = 1e-7
+)
+
+# Function to determine data type
+get_data_type <- function(col) {
+  if (is.numeric(col) && all(col %% 1 == 0, na.rm = TRUE)) {
+    return("poisson")
+  } else if (is.factor(col) || is.character(col)) {
+    return("categorical")
+  } else {
+    return("gaussian")
+  }
+}
+
+# Prepare data and determine clustering function
+prepare_data_and_cluster_function <- function(data) {
+  data_types <- sapply(data, get_data_type)
+  unique_types <- unique(data_types)
+
+  if (length(unique_types) == 1) {
+    cluster_fun <- switch(unique_types,
+                          "poisson" = clusterPoisson,
+                          "categorical" = clusterCategorical,
+                          "gaussian" = clusterDiagGaussian)
+    models <- switch(unique_types,
+                     "poisson" = "poisson_pk_ljk",
+                     "categorical" = "categorical_pk_pjk",
+                     "gaussian" = "gaussian_pk_sjk")
+    return(list(data = data, models = models,
+                cluster_fun = cluster_fun, is_mixed = FALSE))
+  } else {
+    data_list <- lapply(unique_types, function(type) {
+      data[, data_types == type, drop = FALSE]
+    })
+    names(data_list) <- unique_types
+    models <- lapply(unique_types, function(type) {
+      switch(type,
+             "poisson" = "poisson_pk_ljk",
+             "categorical" = "categorical_pk_pjk",
+             "gaussian" = "gaussian_pk_sjk")
+    })
+    names(models) <- unique_types
+    return(list(data = data_list, models = models,
+                cluster_fun = clusterMixedData, is_mixed = TRUE))
+  }
+}
+
+# Function to fit clustering model
+fit_cluster_model <- function(data, G) {
+  tryCatch({
+    prepared <- prepare_data_and_cluster_function(data)
+    if (prepared$is_mixed) {
+      model <- prepared$cluster_fun(prepared$data, nbCluster = G, 
+                                    strategy = quick_precise_strategy, criterion = "BIC", 
+                                    models = prepared$models, nbCore = 0)
+    } else {
+      model <- prepared$cluster_fun(prepared$data, nbCluster = G, 
+                                    strategy = quick_precise_strategy, criterion = "BIC",
+                                    models = prepared$models, nbCore = 0)
+    }
+    return(list(model = model, BIC = -model@criterion, nbCluster = model@nbCluster, error = NULL))
+  }, error = function(e) {
+    return(list(model = NULL, BIC = -Inf, nbCluster = NA, error = e$message))
+  })
+}
+
+
+# Function to remove variables from a vector (remove_var)
+remove_var <- function(vect, varin) {
+  res <- vect[!(vect %in% varin)]
+  return(res)
+}
+
+# Function to add variables to a vector (add_var)
+add_var <- function(vect, varout) {
+  res <- unique(c(vect, varout))
+  res <- sort(res)
+  return(res)
+}
+
+# Function to compute BIC (bicReggen)
+bicReggen <- function(varSelectReg, x, y, family) {
+  x_selected <- x[, varSelectReg, drop = FALSE]
+  data <- data.frame(y = y, x_selected)
+  
+  fit <- tryCatch({
+    if (family != "multinomial") {
+      if (family == "gaussian") {
+        lm(y ~ ., data = data)
+      } else if (family == "poisson") {
+        glm(y ~ ., data = data, family = poisson())
+      }
+    } else {
+      nnet::multinom(y ~ ., data = data, trace = FALSE)
+    }
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(fit)) {
+    bic_value <- Inf
+  } else {
+    n <- length(y)
+    if (family != "multinomial") {
+      bic_value <- -BIC(fit)
+    } else {
+      ll <- logLik(fit)
+      p <- (length(varSelectReg) + 1) * (length(levels(y)) - 1)
+      bic_value <- -(-2 * as.numeric(ll) + log(n) * p)
+    }
+  }
+  return(bic_value)
+}
+
+compute_bic_reg <- function(x, y, family = "gaussian", full_res = FALSE) {
+  x <- as.matrix(x)
+  
+  if (family != "multinomial") {
+    y <- as.vector(unlist(y)) 
+  } else {
+    y <- as.factor(unlist(y)) 
+  }
+  
+  # Check length
+  if (nrow(x) != length(y)) {
+    stop(paste("Mismatch in lengths: x has", nrow(x), 
+               "rows but y has", length(y), "elements"))
+  }
+  
+  n <- length(y)
+  
+  # Initialize variables
+  varSelect <- seq_len(ncol(x))
+  
+  # Perform variable selection using selectReg
+  varSelectReg <- selectReg(varSelect, x, y, family)
+  
+  # Fit model with selected variables
+  x_selected <- x[, varSelectReg, drop = FALSE]
+  data <- data.frame(y = y, x_selected)
+  
+  fit <- tryCatch({
+    if (family != "multinomial") {
+      if (family == "gaussian") {
+        fit <- lm(y ~ ., data = data)
+      } else if (family == "poisson") {
+        fit <- glm(y ~ ., data = data, family = poisson())
+      }
+    } else {
+      fit <- nnet::multinom(y ~ ., data = data, trace = FALSE)
+    }
+    fit
+  }, error = function(e) {
+    stop("Error in fitting the model: ", e$message)
+  })
+  
+  # Compute BIC
+  if (family != "multinomial") {
+    bic_value <- BIC(fit)
+  } else {
+    ll <- logLik(fit)
+    p <- (length(varSelectReg) + 1) * (length(levels(y)) - 1)
+    bic_value <- -2 * as.numeric(ll) + log(n) * p
+  }
+  
+  if (full_res){
+    return(list(BIC = bic_value, 
+                selected_variables = varSelectReg, 
+                model = fit))
+  }
+  else {
+    return(BIC = bic_value)
+  }
+}
+
+compute_bic_reggen <- function(x, y, family = "gaussian", full_res = FALSE) {
+  x <- as.matrix(x)
+  
+  if (family != "multinomial") {
+    y <- as.vector(unlist(y)) 
+  } else {
+    y <- as.factor(unlist(y)) 
+  }
+  
+  # Check if x and y have compatible dimensions
+  if (nrow(x) != length(y)) {
+    stop(paste("Mismatch in lengths: x has", nrow(x), 
+               "rows but y has", length(y), "elements"))
+  }
+  
+  n <- length(y)
+  
+  # Initialize variables
+  varSelect <- seq_len(ncol(x))  # Indices of all variables
+  
+  # Perform variable selection using selectReggen
+  selected_variables <- selectReggen(varSelect, x, y, family)
+  
+  # Fit model with selected variables
+  x_selected <- x[, selected_variables, drop = FALSE]
+  data <- data.frame(y = y, x_selected)
+  
+  fit <- tryCatch({
+    if (family != "multinomial") {
+      if (family == "gaussian") {
+        lm(y ~ ., data = data)
+      } else if (family == "poisson") {
+        glm(y ~ ., data = data, family = poisson())
+      } else if (family == "binomial") {
+        glm(y ~ ., data = data, family = binomial())
+      }
+    } else {
+      nnet::multinom(y ~ ., data = data, trace = FALSE)
+    }
+    fit
+  }, error = function(e) {
+    stop("Error in fitting the model: ", e$message)
+  })
+  
+  # Compute BIC
+  if (family != "multinomial") {
+    bic_value <- BIC(fit)
+  } else {
+    ll <- logLik(fit)
+    p <- (length(selected_variables) + 1) * (length(levels(y)) - 1)
+    bic_value <- -2 * as.numeric(ll) + log(n) * p
+  }
+  
+  if (full_res) {
+    return(list(BIC = bic_value, 
+                selected_variables = selected_variables, 
+                model = fit))
+  } else {
+    return(bic_value)
+  }
+}
+```
+
+
+## BIC regression
+### Version 1
+```{r}
+exclusion_reg <- function(varSelectReg, x, y, family, jE, jI) {
+  bicRegTotal <- bicReggen(varSelectReg, x, y, family)
+  bicDiffReg <- Inf
+  jEmin <- NULL
+  
+  for (j in varSelectReg) {
+    varSelectReg_aux <- setdiff(varSelectReg, j)
+    bic_value <- bicReggen(varSelectReg_aux, x, y, family)
+    bicDiffReg_aux <- bicRegTotal - bic_value
+    
+    if (bicDiffReg_aux <= bicDiffReg) {
+      bicDiffReg <- bicDiffReg_aux
+      jEmin <- j
+    }
+  }
+  
+  if (bicDiffReg <= 0) {
+    varSelectReg <- setdiff(varSelectReg, jEmin)
+    jE <- jEmin
+    stop_flag <- if (!is.null(jI) && jE == jI) 1 else 0
+  } else {
+    jE <- NULL
+    stop_flag <- if (is.null(jI)) 1 else 0
+  }
+  return(list(varSelectReg = varSelectReg, jE = jE, stop = stop_flag))
+}
+
+inclusion_reg <- function(varSelect, varSelectReg, x, y, family, jE, jI) {
+  varSelectRegBis <- setdiff(varSelect, varSelectReg)
+  bicRegTotal <- bicReggen(varSelectReg, x, y, family)
+  bicDiffReg <- -Inf
+  jImax <- NULL
+  
+  if (length(varSelectRegBis) == 0) {
+    return(list(varSelectReg = varSelectReg, jI = NULL, stop = 0))
+  }
+  
+  for (j in varSelectRegBis) {
+    varSelectReg_aux <- c(varSelectReg, j)
+    bic_value <- bicReggen(varSelectReg_aux, x, y, family)
+    bicDiffReg_aux <- -bicRegTotal + bic_value
+    
+    if (bicDiffReg_aux > bicDiffReg) {
+      bicDiffReg <- bicDiffReg_aux
+      jImax <- j
+    }
+  }
+  
+  if (bicDiffReg > 0) {
+    if (!is.null(jE) && jImax == jE) {
+      stop_flag <- 1
+    } else {
+      varSelectReg <- c(varSelectReg, jImax)
+      jI <- jImax
+      stop_flag <- 0
+    }
+  } else {
+    jI <- NULL
+    stop_flag <- 0
+  }
+  return(list(varSelectReg = varSelectReg, jI = jI, stop = stop_flag))
+}
+
+selectReg <- function(varSelect, x, y, family) {
+  varSelectReg <- varSelect
+  jI <- NULL
+  jE <- NULL
+  stop_flag <- 0
+  
+  while (stop_flag == 0 && length(varSelectReg) > 0) {
+    res_excl <- exclusion_reg(varSelectReg, x, y, family, jE, jI)
+    varSelectReg <- res_excl$varSelectReg
+    jE <- res_excl$jE
+    stop_flag <- res_excl$stop
+    
+    if (stop_flag == 0) {
+      res_incl <- inclusion_reg(varSelect, varSelectReg, x, y, family, jE, jI)
+      varSelectReg <- res_incl$varSelectReg
+      jI <- res_incl$jI
+      stop_flag <- res_incl$stop
+    }
+  }
+  return(varSelectReg)
+}
+```
+
+### Version 2 
+```{r}
+# Exclusion step (exclusion_reg)
+exclusion_reg <- function(varSelectReg, x, y, family, jE, jI) {
+  bicRegTotal <- bicReggen(varSelectReg, x, y, family)
+  
+  # Initialization
+  bicDiffReg <- 0.0
+  # Start with the first variable in varSelectReg
+  aux <- varSelectReg[1]
+  numProjets_aux <- remove_var(varSelectReg, aux)
+  # Initialize jEmin with the first variable
+  jEmin <- varSelectReg[1]
+  
+  # Compute bicDiffReg
+  bic_value <- bicReggen(numProjets_aux, x, y, family)
+  bicDiffReg <- bicRegTotal - bic_value
+  
+  # Loop over remaining variables
+  if (length(varSelectReg) > 1) {
+    for (j in varSelectReg[-1]) {
+      aux <- j
+      numProjets_aux <- remove_var(varSelectReg, aux)
+      bic_value <- bicReggen(numProjets_aux, x, y, family)
+      bicDiffReg_aux <- bicRegTotal - bic_value
+      
+      if (bicDiffReg_aux <= bicDiffReg) {
+        bicDiffReg <- bicDiffReg_aux
+        jEmin <- j
+      }
+    }
+  }
+  
+  if (bicDiffReg <= 0) {
+    varSelectReg <- remove_var(varSelectReg, jEmin)
+    jE <- jEmin
+    if (!is.null(jI) && jE == jI) {
+      stop_flag <- 1
+    } else {
+      stop_flag <- 0
+    }
+  } else {
+    jE <- NULL
+    if (is.null(jI)) {
+      stop_flag <- 1
+    } else {
+      stop_flag <- 0
+    }
+  }
+  
+  return(list(varSelectReg = varSelectReg, jE = jE, stop = stop_flag))
+}
+
+# Inclusion step (inclusion_reg)
+inclusion_reg <- function(varSelect, varSelectReg, x, y, family, jE, jI) {
+  bicRegTotal <- bicReggen(varSelectReg, x, y, family)
+  varSelectRegBis <- remove_var(varSelect, varSelectReg)
+  
+  if (length(varSelectRegBis) == 0) {
+    return(list(varSelectReg = varSelectReg, jI = NULL, stop = 0))
+  }
+  
+  # Initialization
+  bicDiffReg <- 0.0
+  aux <- varSelectRegBis[1]
+  numProjets_aux <- add_var(varSelectReg, aux)
+  # Initialize jImax with the first variable
+  jImax <- varSelectRegBis[1]
+  
+  # Compute bicDiffReg
+  bic_value <- bicReggen(numProjets_aux, x, y, family)
+  bicDiffReg <- -bicRegTotal + bic_value
+  
+  # Loop over remaining variables
+  if (length(varSelectRegBis) > 1) {
+    for (j in varSelectRegBis[-1]) {
+      aux <- j
+      numProjets_aux <- add_var(varSelectReg, aux)
+      bic_value <- bicReggen(numProjets_aux, x, y, family)
+      bicDiffReg_aux <- -bicRegTotal + bic_value
+      
+      if (bicDiffReg_aux > bicDiffReg) {
+        bicDiffReg <- bicDiffReg_aux
+        jImax <- j
+      }
+    }
+  }
+  
+  if (bicDiffReg > 0) {
+    if (!is.null(jE) && jImax == jE) {
+      stop_flag <- 1
+    } else {
+      varSelectReg <- add_var(varSelectReg, jImax)
+      jI <- jImax
+      stop_flag <- 0
+    }
+  } else {
+    jI <- NULL
+    stop_flag <- 0
+  }
+  
+  return(list(varSelectReg = varSelectReg, jI = jI, stop = stop_flag))
+}
+
+# Main variable selection function (selectReg)
+selectReg <- function(varSelect, x, y, family) {
+  varSelectReg <- varSelect
+  jI <- NULL
+  jE <- NULL
+  stop_flag <- 0
+  
+  while (stop_flag == 0 && length(varSelectReg) > 0) {
+    # Exclusion step
+    res_excl <- exclusion_reg(varSelectReg, x, y, family, jE, jI)
+    varSelectReg <- res_excl$varSelectReg
+    jE <- res_excl$jE
+    stop_flag <- res_excl$stop
+    
+    # Inclusion step
+    if (stop_flag == 0) {
+      res_incl <- inclusion_reg(varSelect, varSelectReg, x, y, family, jE, jI)
+      varSelectReg <- res_incl$varSelectReg
+      jI <- res_incl$jI
+      stop_flag <- res_incl$stop
+    }
+  }
+  return(varSelectReg)
+}
+```
+
+
+```{r}
+BICreg <- function(x, y)
+{
+  x <- as.matrix(x)
+  y <- as.vector(y)
+  n <- length(y)
+  mod <- bicreg(y = y, x = x, nbest = 1)
+  subset <- which(mod$which[1,])
+  mod <- lm.fit(y = y, x = cbind(1,x[,subset]))
+  # calculate the BIC for the regression
+  sigma <- sqrt(mean(residuals(mod)^2))
+  p <- n - df.residual(mod) + 1
+  return(list(BIC = -n*log(2*pi) -2*n*log(sigma) -n -log(n)*p,
+              selected_variables = subset))
+}
+
+n <- 100
+p <- 10   
+
+x <- matrix(rnorm(n * p), nrow = n, ncol = p)
+colnames(x) <- paste0("X", 1:p)
+
+true_coef <- c(3, -2, 1.5, 0.5, 0.001, rep(0, p - 5))
+
+sigma <- 1
+y <- x %*% true_coef + rnorm(n, mean = 0, sd = sigma)
+y <- as.vector(y)
+
+bic_reg_result <- BICreg(x, y)
+bic_reg_result2 <- compute_bic_reg(x, y, family = "gaussian", full_res = TRUE)
+print(paste("BICreg BIC:", bic_reg_result$BIC))
+print(paste("BICreg BIC2:", bic_reg_result2$BIC))
+bic_reg_result$selected_variables
+bic_reg_result2$selected_variables
+
+```
+
+## Ranking variables
+### Version 1 
+```{r}
+# Penalized Model-Based Clustering with Variable Selection
+penalizedClustering <- function(data, nbClust, lambda = 0, rho = 0, 
+                               strategy = quick_precise_strategy) {
+  
+  # Initialize result storage
+  n <- nrow(data)
+  p <- ncol(data)
+  
+  # Prepare data for clustering
+  cluster_setup <- prepare_data_and_cluster_function(data)
+  
+  # Fit initial model
+  model <- fit_cluster_model(data, nbClust)$model
+  
+  # Extract initial parameters
+  current_means <- t(getMeansByClass(model))
+  current_covs <- getCovariancesByClass(model)
+  current_props <- getProportions(model)
+  current_probs <- getEmissionProb(model)
+  
+  # Initialize storage for convergence check
+  prev_loglik <- -Inf
+  current_loglik <- calculatePenalizedLogLik(data, current_probs, current_means,
+                                           current_covs, current_props, lambda, rho)
+  
+  iter <- 0
+  max_iter <- 250
+  epsilon <- 1e-3
+  
+  while (abs(current_loglik - prev_loglik) > epsilon && iter < max_iter) {
+    prev_loglik <- current_loglik
+    
+    # E-step: Update conditional probabilities
+    current_probs <- updateConditionalProbs(data, current_means, current_covs, 
+                                          current_props)
+    
+    # M-step:
+    # 1. Update proportions
+    current_props <- colMeans(current_probs)
+    
+    # 2. Update means with L1 penalty
+    current_means <- updateMeans(data, current_probs, current_covs, lambda)
+    
+    # 3. Update covariance matrices with L1 penalty on precision
+    emp_covs <- updateEmpiricalCovariance(data, current_probs, current_means)
+    current_covs <- updateCovarianceMatrices(emp_covs, current_probs, rho)
+    
+    # Calculate penalized log-likelihood
+    current_loglik <- calculatePenalizedLogLik(data, current_probs, current_means,
+                                             current_covs, current_props, lambda, rho)
+    
+    iter <- iter + 1
+  }
+  
+  # Determine variable importance
+  var_importance <- determineVariableRole(current_means)
+  
+  return(list(
+    means = current_means,
+    covariances = current_covs,
+    proportions = current_props,
+    probabilities = current_probs,
+    penalized_loglik = current_loglik,
+    var_importance = var_importance,
+    iterations = iter
+  ))
+}
+
+# Update Conditional Probabilities (E-step)
+updateConditionalProbs <- function(data, means, covs, props) {
+  n <- nrow(data)
+  nbClust <- ncol(means)
+  log_probs <- matrix(0, n, nbClust)
+  
+  for (k in 1:nbClust) {
+    log_probs[,k] <- log(props[k]) + apply(data, 1, function(x) {
+      dmvnorm(x, means[,k], covs[[k]], log = TRUE)
+    })
+  }
+  
+  # Numerical stability trick (from original C++ code)
+  max_probs <- apply(log_probs, 1, max)
+  log_probs <- sweep(log_probs, 1, max_probs)
+  
+  probs <- exp(log_probs)
+  probs <- sweep(probs, 1, rowSums(probs), '/')
+  
+  return(probs)
+}
+
+# Update Means with L1 Penalty (M-step)
+updateMeans <- function(data, probs, covs, lambda) {
+  n <- nrow(data)
+  p <- ncol(data)
+  nbClust <- ncol(probs)
+  new_means <- matrix(0, p, nbClust)
+  
+  for (k in 1:nbClust) {
+    W <- solve(covs[[k]])
+    nk <- sum(probs[,k])
+    
+    for (j in 1:p) {
+      # Calculate the second member of equation (15) from Zhou, Pan, Shen 2009
+      T_stat <- sum(probs[,k] * apply(data, 1, function(x) sum(x * W[j,])))
+      T_stat <- T_stat - nk * (sum(W[j,] * new_means[,k]) - 
+                              new_means[j,k] * W[j,j])
+      
+      # Soft thresholding
+      if (abs(T_stat) <= lambda) {
+        new_means[j,k] <- 0
+      } else {
+        new_means[j,k] <- sign(T_stat) * (abs(T_stat) - lambda) / (nk * W[j,j])
+      }
+    }
+  }
+  
+  return(new_means)
+}
+
+# Update Empirical Covariance Matrices
+updateEmpiricalCovariance <- function(data, probs, means) {
+  n <- nrow(data)
+  p <- ncol(data)
+  nbClust <- ncol(probs)
+  emp_covs <- vector("list", nbClust)
+  
+  for (k in 1:nbClust) {
+    nk <- sum(probs[,k])
+    centered_data <- sweep(data, 2, means[,k])
+    emp_covs[[k]] <- t(centered_data) %*% (probs[,k] * centered_data) / nk
+  }
+  
+  return(emp_covs)
+}
+
+# Update Covariance Matrices with Graphical Lasso
+updateCovarianceMatrices <- function(emp_covs, probs, rho) {
+  nbClust <- length(emp_covs)
+  new_covs <- vector("list", nbClust)
+  
+  for (k in 1:nbClust) {
+    nk <- sum(probs[,k])
+    rho_tilde <- 2 * rho / nk
+    
+    glasso_result <- glasso(emp_covs[[k]], rho = rho_tilde, 
+                           penalize.diagonal = FALSE)
+    new_covs[[k]] <- glasso_result$w  # covariance matrix
+  }
+  
+  return(new_covs)
+}
+
+# Calculate Penalized Log-likelihood
+calculatePenalizedLogLik <- function(data, probs, means, covs, props, 
+                                   lambda, rho) {
+  n <- nrow(data)
+  nbClust <- ncol(probs)
+  log_lik <- sum(log(rowSums(probs)))
+  
+  # Add penalties
+  mean_penalty <- lambda * sum(abs(means))
+  precision_penalty <- rho * sum(sapply(covs, function(cov) 
+    sum(abs(solve(cov)))))
+  
+  return(log_lik - mean_penalty - precision_penalty)
+}
+
+# Determine Variable Importance
+determineVariableRole <- function(means) {
+  mu_sum <- rowSums(abs(means))
+  return(as.numeric(mu_sum > 0))
+}
+
+```
+
+### Version 2 
+```{r}
+penalized_EM <- function(X_input, K, lambda, rho, max_iter = 250, tol = 1e-3, 
+                         init_P = NULL, full_res = TRUE) {
+  # X_input: data matrix (n x p)
+  # K: number of clusters
+  # lambda: penalty parameter for means
+  # rho: penalty parameter for precision matrices
+  # max_iter: maximum number of iterations
+  # tol: tolerance for convergence
+  # init_P: optional list of initial parameters
+  
+  epsilon <- 1e-8  # Small constant to prevent division by zero
+  
+  n <- nrow(X_input)
+  p <- ncol(X_input)
+  
+  # Initialization using InitParameter
+  if (is.null(init_P)) {
+    P <- InitParameter(X_input, K, n.start = 250, small.pen = 0.5)
+  } else {
+    P <- init_P
+  }
+  
+  # Extract initial parameters
+  X <- P$X  # X is centered
+  prop <- P$prop
+  Mu <- P$Mu
+  CovarianceMatrix <- P$CovarianceMatrix
+  PrecisionMatrix <- P$PrecisionMatrix
+  ProbCond <- P$ProbCond
+  
+  # Initialize penalized log-likelihood
+  PenLogLik_old <- -Inf
+  
+  # EM Algorithm
+  for (itr in 1:max_iter) {
+    # E-step: Compute conditional probabilities
+    log_densities <- matrix(0, nrow = n, ncol = K)
+    for (k in 1:K) {
+      # Compute log-density for each data point in cluster k
+      S_k_inv <- PrecisionMatrix[, , k]
+      S_k_logdet <- -determinant(PrecisionMatrix[, , k], logarithm = TRUE)$modulus
+      log_densities[, k] <- apply(X, 1, function(x_i) ldcppmvt(x_i, Mu[, k], S_k_inv, S_k_logdet)) + log(pmax(prop[k], epsilon))
+    }
+    # Avoid numerical issues by subtracting the max
+    max_log_densities <- apply(log_densities, 1, max)
+    log_densities <- sweep(log_densities, 1, max_log_densities, "-")
+    densities <- exp(log_densities)
+    densities_sum <- rowSums(densities)
+    densities_sum[densities_sum == 0] <- epsilon  # Prevent division by zero
+    ProbCond <- densities / densities_sum  # Conditional probabilities
+    
+    # M-step: Update parameters
+    Nk <- colSums(ProbCond)  # Effective number of observations in each cluster
+    prop <- pmax(Nk / n, epsilon)           # Update class proportions, prevent zero
+    
+    # Update Means (Mu) with Lasso penalty
+    for (k in 1:K) {
+      tau_k <- ProbCond[, k]
+      Nk_k <- sum(tau_k)
+      W_k <- PrecisionMatrix[, , k]
+      Mu_k <- Mu[, k]
+      
+      for (j in 1:p) {
+        # Compute Tabs correctly
+        Tabs <- abs(sum(tau_k * (X %*% W_k[, j])) + Nk_k * Mu_k[j] * W_k[j, j])
+        if (Tabs <= lambda) {
+          Mu_k[j] <- 0
+        } else {
+          # Ensure proper computation with parentheses
+          T_num <- sum(tau_k * (X %*% W_k[, j])) - Nk_k * (W_k[j, ] %*% Mu_k) + Nk_k * Mu_k[j] * W_k[j, j]
+          denominator <- Nk_k * W_k[j, j] + epsilon  # Prevent division by zero
+          if (T_num < 0) {
+            Mu_k[j] <- (T_num + lambda) / denominator
+          } else {
+            Mu_k[j] <- (T_num - lambda) / denominator
+          }
+        }
+      }
+      Mu[, k] <- Mu_k
+    }
+    
+    # Update covariance matrices with graphical Lasso
+    for (k in 1:K) {
+      tau_k <- ProbCond[, k]
+      Nk_k <- sum(tau_k)
+      # Compute empirical covariance matrix
+      diff <- sweep(X, 2, Mu[, k], "-")
+      weighted_diff <- sqrt(tau_k) * diff
+      S_k <- crossprod(weighted_diff) / Nk_k
+      # Ensure S_k is positive definite
+      if (any(is.na(S_k)) || any(is.infinite(S_k))) {
+        warning(paste("Cluster", k, ": Covariance matrix computation resulted in invalid values."))
+        next  # Skip updating this cluster
+      }
+      # Apply graphical Lasso
+      rho_tilde <- (2 * rho) / Nk_k
+      glasso_res <- tryCatch({
+        glasso::glasso(S_k, rho = rho_tilde, penalize.diagonal = FALSE, thr = 1e-4, maxit = 1000)
+      }, error = function(e) {
+        warning(paste("Graphical Lasso failed for cluster", k, ":", e$message))
+        return(NULL)
+      })
+      if (!is.null(glasso_res)) {
+        CovarianceMatrix[, , k] <- glasso_res$w
+        PrecisionMatrix[, , k] <- glasso_res$wi
+      }
+    }
+    
+    # Compute penalized log-likelihood
+    PenLogLik_new <- 0
+    for (i in 1:n) {
+      log_dens_i <- numeric(K)
+      for (k in 1:K) {
+        S_k_inv <- PrecisionMatrix[, , k]
+        S_k_logdet <- -determinant(PrecisionMatrix[, , k], logarithm = TRUE)$modulus
+        log_dens_i[k] <- ldcppmvt(X[i, ], Mu[, k], S_k_inv, S_k_logdet) + log(pmax(prop[k], epsilon))
+      }
+      max_log_dens_i <- max(log_dens_i)
+      log_dens_i <- log_dens_i - max_log_dens_i
+      dens_i <- exp(log_dens_i)
+      PenLogLik_new <- PenLogLik_new + (max_log_dens_i + log(sum(dens_i)))
+    }
+    # Subtract penalties
+    PenLogLik_new <- PenLogLik_new - lambda * sum(abs(Mu)) - rho * sum(abs(PrecisionMatrix))
+    
+    # Check convergence
+    if (abs(PenLogLik_new - PenLogLik_old) < tol) {
+      message("Converged in ", itr, " iterations.")
+      break
+    }
+    PenLogLik_old <- PenLogLik_new
+    if (itr %% 10 == 0) {
+      message("Iteration ", itr, " Penalized Log-Likelihood: ", PenLogLik_new)
+    }
+  }
+  
+  # Determine variable roles
+  Mu_abs_sum <- rowSums(abs(Mu))
+  variable_roles <- ifelse(Mu_abs_sum == 0, 0, 1)  # 0: variable not used, 1: variable used
+  if (full_res){
+    return(list(Mu = Mu, CovarianceMatrix = CovarianceMatrix, PrecisionMatrix = PrecisionMatrix,
+                ProbCond = ProbCond, prop = prop, PenLogLik = PenLogLik_new, variable_roles = variable_roles))
+  }
+  else{
+    return(variable_roles)
+  }
+}
+
+ldcppmvt <- function(x, mu, SInv, SLogDet) {
+  log2pi <- log(2.0 * pi)
+  xdim <- length(x)
+  constants <- -0.5 * xdim * log2pi
+  Qf <- as.numeric(t(x - mu) %*% SInv %*% (x - mu))  # Ensure numeric
+  if (is.nan(Qf) || is.infinite(Qf)) {
+    return(-Inf)
+  }
+  lret <- constants - (0.5 * SLogDet) - (0.5 * Qf)
+  return(as.numeric(lret))
+}
+
+```
+
+## Select variables 
+### Select S
+#### Version 1 
+```{r}
+# Function to perform variable selection for S variables
+select_S <- function(x, G, order = NULL, packSize = 1) {
+  # x: data frame or matrix
+  # G: number of clusters
+  # packSize: number of variables to consider at each iteration
+  if (is.null(order)){variable_order <- seq_len(ncol(x))}
+  else {variable_order <- order}
+  
+  firstIndex <- 1
+  lastIndex <- firstIndex + packSize - 1
+  selected_variables <- variable_order[1]
+  CritValue <- -Inf
+  stop_flag <- FALSE
+  clustering_error <- NULL
+  
+  # Initial clustering with the first variable
+  current_data <- x[, selected_variables, drop = FALSE]
+  clustering_result <- fit_cluster_model(current_data, G)
+  CritValue <- clustering_result$BIC
+  clustering_error <- clustering_result$error
+  
+  while (!stop_flag && firstIndex <= length(variable_order) && is.null(clustering_error)) {
+    var_added <- FALSE
+    for (idx in firstIndex:min(lastIndex, length(variable_order))) {
+      candidate_variable <- variable_order[idx]
+      if (!(candidate_variable %in% selected_variables)) {
+        candidate_variables <- c(selected_variables, candidate_variable)
+        candidate_data <- x[, candidate_variables, drop = FALSE]
+        # Clustering with candidate variables
+        clustering_result_aux <- fit_cluster_model(candidate_data, G)
+        clustering_error <- clustering_result_aux$error
+        
+        if (is.null(clustering_error)) {
+          CritValue_aux <- clustering_result_aux$BIC
+          
+          # Compute BIC difference using regression on the new variable
+          y <- x[, candidate_variable]
+          other_variables <- x[, selected_variables, drop = FALSE]
+          regression_result <- compute_bic_reg(other_variables, y, full_res = TRUE)
+          bic_value <- regression_result$BIC
+          
+          critDiffClust <- CritValue_aux - CritValue - bic_value
+          
+          if (critDiffClust > 0) {
+            selected_variables <- candidate_variables
+            CritValue <- CritValue_aux
+            var_added <- TRUE
+          }
+        }
+      }
+    }
+    if (!var_added) {
+      stop_flag <- TRUE
+    }
+    firstIndex <- lastIndex + 1
+    lastIndex <- firstIndex + packSize - 1
+  }
+  
+  # Final clustering with selected variables
+  final_data <- x[, selected_variables, drop = FALSE]
+  final_clustering <- fit_cluster_model(final_data, G)
+  
+  return(list(S = selected_variables,
+              model = final_clustering$model,
+              criterionValue = final_clustering$BIC,
+              nbCluster = final_clustering$nbCluster,
+              partition = if (!is.null(final_clustering$model)) final_clustering$model@zi else NULL))
+}
+```
+
+#### Version 2
+
+```{r}
+select_S <- function(x, G, order = NULL, packSize = 1) {
+  # Input validation
+  if (!is.matrix(x) && !is.data.frame(x)) 
+    stop("x must be a matrix or data frame")
+  
+  # Initialize parameters
+  InitialProjectsNb <- nrow(x)
+  if (is.null(order)) {
+    variable_order <- seq_len(ncol(x))
+  } else {
+    variable_order <- order
+  }
+  
+  # Initialize tracking variables - 
+  firstIndex <- 1
+  lastIndex <- firstIndex + packSize
+  ClustVar <- 1000  # Matching C++ initialization
+  selected_variables <- variable_order[1]
+  
+  # Initial clustering with first variable
+  current_data <- x[, selected_variables, drop = FALSE]
+  clustering_result <- fit_cluster_model(current_data, G)
+  
+  CritValue <- clustering_result$BIC
+  s_target <- if(is.null(clustering_result$error)) "No error" else "Error"
+  
+  # Main selection loop - 
+  while((ClustVar > 0) && (firstIndex < length(variable_order)) && 
+        (s_target == "No error")) {
+    
+    ClustVar <- 0  # Reset at start of each iteration
+    
+    for(idx in firstIndex:min(lastIndex - 1, length(variable_order))) {
+      candidate_variable <- variable_order[idx]
+      
+      if (!(candidate_variable %in% selected_variables)) {
+        # Get the data type for the candidate variable
+        data_type <- get_data_type(x[, candidate_variable])
+        
+        # Prepare regression variables
+        y <- x[, candidate_variable, drop = FALSE]
+        other_variables <- x[, selected_variables, drop = FALSE]
+        
+        # Compute regression BIC using the new helper function
+        regression_result <- compute_bic_reg(
+          other_variables, 
+          y, 
+          family = data_type,
+          full_res = TRUE
+        )
+        
+        # Prepare candidate variables for clustering
+        candidate_variables <- c(selected_variables, candidate_variable)
+        candidate_data <- x[, candidate_variables, drop = FALSE]
+        
+        # Fit clustering model with candidate variables
+        clustering_result_aux <- fit_cluster_model(candidate_data, G)
+        
+        s_target <- if(is.null(clustering_result_aux$error)) "No error" else "Error"
+        
+        if (s_target == "No error") {
+          CritValue_aux <- clustering_result_aux$BIC
+          
+          # Calculate criterion difference
+          critDiffClust <- CritValue_aux - CritValue - regression_result$BIC
+          
+          # Update if improvement found
+          if (critDiffClust > 0) {
+            selected_variables <- candidate_variables
+            CritValue <- CritValue_aux
+            ClustVar <- ClustVar + 1
+          }
+        }
+      }
+    }
+    
+    # Update indices
+    firstIndex <- lastIndex
+    lastIndex <- firstIndex + packSize
+  }
+  
+  # Final clustering with selected variables
+  final_data <- x[, selected_variables, drop = FALSE]
+  final_clustering <- fit_cluster_model(final_data, G)
+  
+  # Return results matching the ClusterDiagGaussian slot names
+  return(list(
+    S = selected_variables,
+    model = final_clustering$model,
+    criterionValue = if (!is.null(final_clustering$model)) 
+      final_clustering$model@criterion else NULL,
+    criterion = if (!is.null(final_clustering$model)) 
+      final_clustering$model@criterionName else "BIC",
+    nbcluster = if (!is.null(final_clustering$model)) 
+      final_clustering$model@nbCluster else NULL,
+    parameters = if (!is.null(final_clustering$model)) 
+      final_clustering$model@component else NULL,  # Using component slot for parameters
+    proba = if (!is.null(final_clustering$model)) 
+      final_clustering$model@tik else NULL,        # Using tik slot for probabilities
+    partition = if (!is.null(final_clustering$model)) 
+      final_clustering$model@zi else NULL          # Using zi slot for partition
+  ))
+}
+
+```
+
+### Select W
+```{r}
+# The C++ version maintains a role vector to track selected variables
+select_W <- function(x, selected_S, packSize = 1) {
+  # Initialize variables
+  variable_order <- seq_len(ncol(x))
+  remaining_variables <- setdiff(variable_order, selected_S)
+  
+  # Initialize tracking vector 
+  var_role <- numeric(ncol(x))
+  
+  lastIndex <- length(remaining_variables)
+  firstIndex <- max(1, lastIndex - packSize + 1)
+  independent_variables <- c()
+  
+  # Continue while we can find independent variables and haven't processed all
+  while (firstIndex >= 1) {
+    clust_var <- 0
+    
+    # Process current pack of variables
+    for (idx in seq(lastIndex, firstIndex, by = -1)) {
+      if (idx >= 1) {
+        candidate_variable <- remaining_variables[idx]
+        
+        # Get other variables (excluding already selected and current candidate)
+        other_variables <- remaining_variables[
+          which(var_role[remaining_variables] == 0 & 
+                remaining_variables != candidate_variable)
+        ]
+        
+        # Combine with previously selected S variables
+        x_other <- x[, c(selected_S, other_variables), drop = FALSE]
+        y <- x[, candidate_variable]
+        
+        # Check independence through regression
+        regression_result <- compute_bic_reg(x_other, y, full_res = TRUE)
+        
+        if (length(regression_result$selected_variables) == 0) {
+          independent_variables <- c(independent_variables, candidate_variable)
+          var_role[candidate_variable] <- 1
+          clust_var <- clust_var + 1
+        }
+      }
+    }
+    
+    # Update indices for next iteration
+    lastIndex <- firstIndex - 1
+    firstIndex <- max(1, firstIndex - packSize)
+    
+    # Break if no variables were added in this iteration
+    if (clust_var == 0) {
+      break
+    }
+  }
+  
+  return(independent_variables)
+}
+```
+
+### Select R
+```{r}
+# Exclusion step (exclusion_reggen)
+exclusion_reggen <- function(varSelectReg, x, y, family, jE, jI) {
+  bicRegTotal <- bicReggen(varSelectReg, x, y, family)
+  
+  # Initialization
+  bicDiffReg <- 0.0
+  # Start with the first variable in varSelectReg
+  aux <- varSelectReg[1]
+  numExpAux <- remove_var(varSelectReg, aux)
+  # Initialize jEmin with the first variable
+  jEmin <- varSelectReg[1]
+  
+  # Compute bicDiffReg
+  bic_value <- bicReggen(numExpAux, x, y, family)
+  bicDiffReg <- bicRegTotal - bic_value
+  
+  # Loop over remaining variables
+  if (length(varSelectReg) > 1) {
+    for (j in varSelectReg[-1]) {
+      aux <- j
+      numExpAux <- remove_var(varSelectReg, aux)
+      bic_value <- bicReggen(numExpAux, x, y, family)
+      bicDiffReg_aux <- bicRegTotal - bic_value
+      
+      if (bicDiffReg_aux <= bicDiffReg) {
+        bicDiffReg <- bicDiffReg_aux
+        jEmin <- j
+      }
+    }
+  }
+  
+  if (bicDiffReg <= 0) {
+    varSelectReg <- remove_var(varSelectReg, jEmin)
+    jE <- jEmin
+    if (!is.null(jI) && jE == jI) {
+      stopreg <- 1
+    } else {
+      stopreg <- 0
+    }
+  } else {
+    jE <- NULL
+    if (is.null(jI)) {
+      stopreg <- 1
+    } else {
+      stopreg <- 0
+    }
+  }
+  
+  return(list(varSelectReg = varSelectReg, jE = jE, stop = stopreg))
+}
+
+# Inclusion step (inclusion_reggen)
+inclusion_reggen <- function(varSelect, varSelectReg, x, y, family, jE, jI) {
+  bicRegTotal <- bicReggen(varSelectReg, x, y, family)
+  varSelectRegBis <- remove_var(varSelect, varSelectReg)
+  
+  if (length(varSelectRegBis) == 0) {
+    return(list(varSelectReg = varSelectReg, jI = NULL, stop = 0))
+  }
+  
+  # Initialization
+  bicDiffReg <- 0.0
+  aux <- varSelectRegBis[1]
+  numExpAux <- add_var(varSelectReg, aux)
+  # Initialize jImax with the first variable
+  jImax <- varSelectRegBis[1]
+  
+  # Compute bicDiffReg
+  bic_value <- bicReggen(numExpAux, x, y, family)
+  bicDiffReg <- -bicRegTotal + bic_value
+  
+  # Loop over remaining variables
+  if (length(varSelectRegBis) > 1) {
+    for (j in varSelectRegBis[-1]) {
+      aux <- j
+      numExpAux <- add_var(varSelectReg, aux)
+      bic_value <- bicReggen(numExpAux, x, y, family)
+      bicDiffReg_aux <- -bicRegTotal + bic_value
+      
+      if (bicDiffReg_aux > bicDiffReg) {
+        bicDiffReg <- bicDiffReg_aux
+        jImax <- j
+      }
+    }
+  }
+  
+  if (bicDiffReg > 0) {
+    if (!is.null(jE) && jImax == jE) {
+      stopreg <- 1
+    } else {
+      varSelectReg <- add_var(varSelectReg, jImax)
+      jI <- jImax
+      stopreg <- 0
+    }
+  } else {
+    jI <- NULL
+    stopreg <- 0
+  }
+  
+  return(list(varSelectReg = varSelectReg, jI = jI, stop = stopreg))
+}
+
+# Main variable selection function (selectReggen)
+selectReggen <- function(varSelect, x, y, family) {
+  varSelectReg <- varSelect
+  jI <- NULL
+  jE <- NULL
+  stopreg <- 0
+  
+  while (stopreg == 0 && length(varSelectReg) > 0) {
+    # Exclusion step
+    res_excl <- exclusion_reggen(varSelectReg, x, y, family, jE, jI)
+    varSelectReg <- res_excl$varSelectReg
+    jE <- res_excl$jE
+    stopreg <- res_excl$stop
+    
+    # Inclusion step
+    if (stopreg == 0) {
+      res_incl <- inclusion_reggen(varSelect, varSelectReg, x, y, family, jE, jI)
+      varSelectReg <- res_incl$varSelectReg
+      jI <- res_incl$jI
+      stopreg <- res_incl$stop
+    }
+  }
+  return(varSelectReg)
+}
+```
+
+## Criterion-Select Variable
+```{r}
+# Function to compute the criterion and select variables/models
+compute_criterion <- function(X, MyList, rgm, idm) {
+  # Extract variables from MyList
+  varSelectClust <- MyList$S    # Variables selected for clustering (S)
+  varNonIndep <- MyList$U       # Redundant variables (U)
+  varIndep <- MyList$W          # Independent variables (W)
+  critClustFinal <- MyList$criterionValue  # Clustering criterion value
+  
+  # Initialize variables
+  initsave <- 0
+  Lmax <- -Inf
+  SFinal <- NULL
+  RFinal <- NULL
+  UFinal <- NULL
+  WFinal <- NULL
+  reg <- NULL
+  rhat <- NULL
+  lhat <- NULL
+  
+  Empty <- integer(0)
+  
+  # Mapping models from strings to families
+  map_model_to_family <- function(model_code) {
+    switch(model_code,
+           "Norm" = "gaussian",
+           "PO" = "poisson",
+           "Mult" = "multinomial",
+           stop("Unknown model code"))
+  }
+  
+  regmodels <- rgm
+  indepmodels <- idm
+  
+  # Begin logic
+  if (length(varIndep) == 0) {  # No independent variables (W)
+    if (length(varNonIndep) == 0) {  # No redundant variables (U)
+      crit <- critClustFinal
+      if ((initsave == 0) || ((initsave == 1) & (crit > Lmax))) {
+        initsave <- 1
+        SFinal <- varSelectClust
+        RFinal <- Empty
+        UFinal <- Empty
+        WFinal <- Empty
+        rhat <- NULL
+        lhat <- NULL
+        Lmax <- crit
+      }
+    } else {  # Redundant variables (U) exist
+      if (length(varNonIndep) == 1) {  # Single redundant variable
+        # Use the first regression model in rgm
+        family <- map_model_to_family(regmodels[1])
+        # Perform regression variable selection
+        y <- X[, varNonIndep]
+        x <- X[, varSelectClust, drop = FALSE]
+        result_reg <- compute_bic_reg(x, y, family = family, full_res = TRUE)
+        BicRegFinal <- result_reg$BIC
+        crit <- critClustFinal + BicRegFinal
+        if ((initsave == 0) || ((initsave == 1) & (crit > Lmax))) {
+          initsave <- 1
+          SFinal <- varSelectClust
+          RFinal <- result_reg$selected_variables
+          UFinal <- varNonIndep
+          WFinal <- Empty
+          rhat <- regmodels[1]
+          lhat <- NULL
+          Lmax <- crit
+          reg <- result_reg$model
+        }
+      } else {  # Multiple redundant variables
+        for (p in seq_along(regmodels)) {
+          family <- map_model_to_family(regmodels[p])
+          y <- X[, varNonIndep]
+          x <- X[, varSelectClust, drop = FALSE]
+          result_reg <- compute_bic_reggen(x, y, family = family, full_res = TRUE)
+          BicRegFinal <- result_reg$BIC
+          crit <- critClustFinal + BicRegFinal
+          if ((initsave == 0) || ((initsave == 1) & (crit > Lmax))) {
+            initsave <- 1
+            SFinal <- varSelectClust
+            RFinal <- result_reg$selected_variables
+            UFinal <- varNonIndep
+            WFinal <- Empty
+            rhat <- regmodels[p]
+            lhat <- NULL
+            Lmax <- crit
+            reg <- result_reg$model
+          }
+        }
+      }
+    }
+  } else {  # Independent variables (W) exist
+    # Compute BIC for independent variables for each model in idm
+    BicIndepFinal <- numeric(length(indepmodels))
+    for (l in seq_along(indepmodels)) {
+      family_indep <- map_model_to_family(indepmodels[l])
+      BicIndep <- 0
+      for (i in varIndep) {
+        y <- X[, i]
+        data <- data.frame(y = y)
+        fit <- tryCatch({
+          if (family_indep == "gaussian") {
+            lm(y ~ 1, data = data)
+          } else if (family_indep == "binomial") {
+            if (!is.factor(y)) y <- as.factor(y)
+            glm(y ~ 1, data = data, family = binomial())
+          } else if (family_indep == "poisson") {
+            glm(y ~ 1, data = data, family = poisson())
+          } else if (family_indep == "multinomial") {
+            if (!is.factor(y)) y <- as.factor(y)
+            nnet::multinom(y ~ 1, data = data, trace = FALSE)
+          } else {
+            stop("Unsupported family")
+          }
+        }, error = function(e) {
+          return(NULL)
+        })
+        if (is.null(fit)) {
+          bic_value <- Inf
+        } else {
+          bic_value <- BIC(fit)
+        }
+        BicIndep <- BicIndep + bic_value
+      }
+      BicIndepFinal[l] <- BicIndep
+    }
+    
+    if (length(varNonIndep) == 0) {  # No redundant variables (U)
+      for (l in seq_along(indepmodels)) {
+        crit <- critClustFinal + BicIndepFinal[l]
+        if ((initsave == 0) || ((initsave == 1) & (crit > Lmax))) {
+          initsave <- 1
+          SFinal <- varSelectClust
+          RFinal <- Empty
+          UFinal <- Empty
+          WFinal <- varIndep
+          rhat <- NULL
+          lhat <- indepmodels[l]
+          Lmax <- crit
+        }
+      }
+    } else {  # Redundant variables (U) exist
+      if (length(varNonIndep) == 1) {  # Single redundant variable
+        # Use the first regression model in rgm
+        family <- map_model_to_family(regmodels[1])
+        y <- X[, varNonIndep]
+        x <- X[, varSelectClust, drop = FALSE]
+        result_reg <- compute_bic_reg(x, y, family = family, full_res = TRUE)
+        BicRegFinal <- result_reg$BIC
+        for (l in seq_along(indepmodels)) {
+          crit <- critClustFinal + BicRegFinal + BicIndepFinal[l]
+          if ((initsave == 0) || ((initsave == 1) & (crit > Lmax))) {
+            initsave <- 1
+            SFinal <- varSelectClust
+            RFinal <- result_reg$selected_variables
+            UFinal <- varNonIndep
+            WFinal <- varIndep
+            rhat <- regmodels[1]
+            lhat <- indepmodels[l]
+            Lmax <- crit
+            reg <- result_reg$model
+          }
+        }
+      } else {  # Multiple redundant variables
+        for (p in seq_along(regmodels)) {
+          family <- map_model_to_family(regmodels[p])
+          y <- X[, varNonIndep]
+          x <- X[, varSelectClust, drop = FALSE]
+          result_reg <- compute_bic_reggen(x, y, family = family, full_res = TRUE)
+          BicRegFinal <- result_reg$BIC
+          for (l in seq_along(indepmodels)) {
+            crit <- critClustFinal + BicRegFinal + BicIndepFinal[l]
+            if ((initsave == 0) || ((initsave == 1) & (crit > Lmax))) {
+              initsave <- 1
+              SFinal <- varSelectClust
+              RFinal <- result_reg$selected_variables
+              UFinal <- varNonIndep
+              WFinal <- varIndep
+              rhat <- regmodels[p]
+              lhat <- indepmodels[l]
+              Lmax <- crit
+              reg <- result_reg$model
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  # For clustering, adjust models according to data types
+  # Prepare data and models
+  data_clust <- X[, SFinal, drop = FALSE]
+  prepared <- prepare_data_and_cluster_function(data_clust)
+  
+  # Fit clustering model with the selected variables
+  clustering_result <- fit_cluster_model(data_clust, G = MyList$nbcluster)
+  
+  # Collect clustering results
+  model <- clustering_result$model
+  criterionValue <- clustering_result$BIC
+  nbcluster <- clustering_result$nbCluster
+  parameters <- model@component@parameters
+  proba <- model@zi
+  partition <- model@zi
+  
+  # Return the best combination
+  return(list(S = SFinal,
+              R = RFinal,
+              U = UFinal,
+              W = WFinal,
+              criterionValue = Lmax,
+              criterion = "BIC",
+              nbcluster = nbcluster,
+              model = model,
+              rmodel = rhat,
+              imodel = lhat,
+              parameters = parameters,
+              proba = proba,
+              partition = partition,
+              regparameters = reg))
+}
+```
+
+## Main Functions
+### Model Selection
+```{r}
+ModelSelectionClust <- function(VariableSelectRes,
+                                data,
+                                rmodel,
+                                imodel,
+                                nbcores)
+{
+  mylist.size <- length(VariableSelectRes)
+  
+  # Handle the case when VariableSelectRes is a single list or a list of lists
+  if (mylist.size == 1 && is.list(VariableSelectRes[[1]])) {
+    VariableSelectRes <- VariableSelectRes[[1]]
+    mylist.size <- length(VariableSelectRes)
+  }
+  
+  if (mylist.size == 1) {
+    mylist <- VariableSelectRes
+    junk <- try(compute_criterion(data, 
+                                  mylist, 
+                                  rmodel, 
+                                  imodel), silent = TRUE)
+  } else {
+    wrapper.compute_criterion <- function(idx) {
+      mylist <- VariableSelectRes[[idx]]
+      res <- try(compute_criterion(data, 
+                                   mylist, 
+                                   rmodel, 
+                                   imodel), silent = TRUE)
+      return(res)
+    }
+    
+    if (mylist.size < nbcores) 
+      nbcores <- mylist.size
+    
+    if (Sys.info()["sysname"] == "Windows") {
+      cl <- makeCluster(nbcores)
+      common.objects <- c("data", "VariableSelectRes", "rmodel", "imodel", "compute_criterion")
+      clusterExport(cl = cl, varlist = common.objects, envir = environment())
+      # Load necessary packages on each worker
+      clusterEvalQ(cl, library(nnet))
+      junk <- parLapply(cl, 
+                        X = as.integer(1:mylist.size), 
+                        fun = wrapper.compute_criterion)
+      stopCluster(cl)
+    } else {
+      junk <- mclapply(X = as.integer(1:mylist.size), 
+                       FUN = wrapper.compute_criterion,
+                       mc.cores = nbcores,
+                       mc.silent = TRUE,
+                       mc.preschedule = TRUE,
+                       mc.cleanup = TRUE)
+    }
+  }
+  
+  # Selecting the best model
+  if (mylist.size == 1 && class(junk) != "try-error") {
+    bestModel <- junk
+  } else { 
+    lmax <- -Inf
+    bestModel <- NULL
+    for (idx in seq_len(mylist.size)) {
+      result <- junk[[idx]]
+      if ((class(result) != "try-error") && !is.null(result$criterionValue) && (result$criterionValue > lmax)) {
+        bestModel <- result
+        lmax <- bestModel$criterionValue 
+      }
+    }
+    if (is.null(bestModel)) {
+      stop("No valid models were found.")
+    }
+  }
+  
+  # Adjusting bestModel components
+  if (length(bestModel$R) == 0 || is.null(bestModel$R)) {
+    bestModel$R <- NULL
+    bestModel$W <- c(bestModel$U, bestModel$W)
+    bestModel$U <- NULL
+  }
+  
+  if (length(bestModel$W) == 0 || is.null(bestModel$W))
+    bestModel$W <- NULL
+  
+  return(bestModel)
+}
+
+
+```
+### Clustering EM Glasso
+#### Version 1
+```{r}
+ClusteringEMGlasso <- function(data, 
+                               nbcluster, 
+                               lambda, 
+                               rho,
+                               nbcores = 1)
+{
+  # Load required packages
+  library(glasso)
+  library(parallel)
+  library(matrixStats)
+  library(MASS)
+  
+  # Ensure data is a matrix
+  data <- as.matrix(data)
+  n <- nrow(data)
+  p <- ncol(data)
+  
+  # Adjust number of cores if necessary
+  total_combinations <- length(lambda) * length(rho)
+  if (total_combinations < nbcores)
+    nbcores <- total_combinations
+  
+  # Prepare penalty grid
+  pen_grid <- expand.grid(lambda = lambda, rho = rho)
+  n_pen <- nrow(pen_grid)
+  
+  # Initialize VarRole array
+  VarRole <- array(0, dim = c(n_pen, p, length(nbcluster)))
+  
+  # Set up cluster for parallel computation if on Windows
+  if (Sys.info()["sysname"] == "Windows") {
+    cl <- makeCluster(nbcores)
+    clusterEvalQ(cl, {
+      library(glasso)
+      library(matrixStats)
+      library(MASS)
+    })
+  }
+  
+  # Loop over each number of clusters
+  for (k_idx in seq_along(nbcluster)) {
+    K <- nbcluster[k_idx]
+    
+    # Initialize parameters using InitParameter
+    P <- InitParameter(data, K, n.start = 250, small.pen = 0.5)
+    
+    # Define function to run penalized_EM for given index
+    run_penalized_EM <- function(idx) {
+      params <- pen_grid[idx, ]
+      lambda_i <- params$lambda
+      rho_i <- params$rho
+      result <- tryCatch({
+        penalized_EM(X = data, K = K, lambda = lambda_i, rho = rho_i, init_P = P)
+      }, error = function(e) {
+        NULL
+      })
+      return(result)
+    }
+    
+    if (Sys.info()["sysname"] == "Windows") {
+      # Export necessary variables and functions to the cluster
+      clusterExport(cl, varlist = c("data", "K", "P", "penalized_EM"), envir = environment())
+      # Run penalized_EM in parallel on the cluster
+      results_list_K <- parLapply(cl, seq_len(n_pen), run_penalized_EM)
+    } else {
+      # Run penalized_EM in parallel using mclapply
+      results_list_K <- mclapply(seq_len(n_pen), run_penalized_EM, mc.cores = nbcores)
+    }
+    
+    # Extract variable roles and store in VarRole array
+    var_role_matrix <- matrix(0, nrow = n_pen, ncol = p)
+    for (j in seq_len(n_pen)) {
+      result <- results_list_K[[j]]
+      if (!is.null(result) && !is.null(result$variable_roles)) {
+        var_role_matrix[j, ] <- result$variable_roles
+      } else {
+        var_role_matrix[j, ] <- NA  # Use NA for failed computations
+      }
+    }
+    VarRole[, , k_idx] <- var_role_matrix
+  }
+  
+  # Stop the cluster if it was created
+  if (Sys.info()["sysname"] == "Windows") {
+    stopCluster(cl)
+  }
+  
+  # Return the array of variable roles
+  return(VarRole)
+}
+```
+
+#### Version 2
+```{r}
+ClusteringEMGlasso <- function(data, 
+                              nbcluster, 
+                              lambda, 
+                              rho,
+                              nbcores,
+                              max_iter = 250,
+                              tol = 1e-3) {
+  # Input validation
+  data <- as.matrix(data)
+  n <- as.integer(dim(data)[1])
+  p <- as.integer(dim(data)[2])
+  nbcluster <- as.integer(nbcluster)
+  
+  # Adjust number of cores
+  if((length(lambda) * length(rho)) < nbcores) {
+    nbcores <- (length(lambda) * length(rho))
+  }
+  
+  # Setup parallel processing
+  if(Sys.info()["sysname"] == "Windows") {
+    cl <- makeCluster(nbcores)
+    on.exit(stopCluster(cl))
+  }
+  
+  # Initialize parameters
+  init_params <- if(length(nbcluster) == 1) {
+    list(InitParameter(data, nbcluster, n.start = 250, small.pen = 0.5))
+  } else {
+    wrapper.init.parameter <- function(k) {
+      InitParameter(data, k, n.start = 250, small.pen = 0.5)
+    }
+    
+    if(Sys.info()["sysname"] == "Windows") {
+      clusterExport(cl, c("InitParameter"), envir = environment())
+      clusterEvalQ(cl, require(glasso))
+      clusterApply(cl, as.integer(nbcluster), wrapper.init.parameter)
+    } else {
+      parallel::mclapply(
+        X = as.integer(nbcluster),
+        FUN = wrapper.init.parameter,
+        mc.cores = nbcores,
+        mc.preschedule = TRUE,
+        mc.cleanup = TRUE
+      )
+    }
+  }
+  
+  # Wrapper function for penalized_EM
+  wrapper.penalized_em <- function(params) {
+    lambda_val <- params[1]
+    rho_val <- params[2]
+    
+    tryCatch({
+      result <- penalized_EM(
+        X_input = data,
+        K = nbcluster,
+        lambda = lambda_val,
+        rho = rho_val,
+        max_iter = max_iter,
+        tol = tol,
+        init_P = P,
+        full_res = FALSE
+      )
+      return(result)
+    }, error = function(e) {
+      return(rep(0, p))  # Return zeros if algorithm fails
+    })
+  }
+  
+  # Create penalty grid
+  pen.grid <- as.matrix(expand.grid(lambda, rho))
+  VarRole <- array(0, dim = c((length(lambda) * length(rho)), p, length(nbcluster)))
+  parallel.varrole <- vector("list", length(nbcluster))
+  
+  # Main processing loop
+  for(k in seq_along(nbcluster)) {
+    P <- init_params[[k]]
+    
+    if(Sys.info()["sysname"] == "Windows") {
+      clusterExport(cl, c("P", "penalized_EM", "ldcppmvt"), envir = environment())
+      clusterEvalQ(cl, {
+        require(glasso)
+        require(Matrix)
+      })
+      
+      parallel.varrole[[k]] <- parApply(
+        cl,
+        X = pen.grid,
+        MARGIN = 1,
+        FUN = wrapper.penalized_em
+      )
+    } else {
+      parallel.varrole[[k]] <- parallel::mclapply(
+        X = as.list(data.frame(t(pen.grid))),
+        FUN = wrapper.penalized_em,
+        mc.cores = nbcores,
+        mc.preschedule = TRUE,
+        mc.cleanup = TRUE
+      )
+    }
+    
+    # Process results
+    var.role <- matrix(0, (length(lambda) * length(rho)), p)
+    for(j in seq_len(nrow(var.role))) {
+      if(!inherits(parallel.varrole[[k]][[j]], "try-error")) {
+        var.role[j,] <- parallel.varrole[[k]][[j]]
+      }
+    }
+    VarRole[,,k] <- var.role
+  }
+  
+  # Add attributes for consistency with original implementation
+  attr(VarRole, "lambda") <- lambda
+  attr(VarRole, "rho") <- rho
+  attr(VarRole, "nbcluster") <- nbcluster
+  
+  return(VarRole)
+}
+```
+
+### SortvarClust
+#### Version 1
+```{r}
+SortvarClust <- function(x,
+                         nbcluster,
+                         type = "lasso",
+                         lambda = seq(20, 100, by = 10),
+                         rho = seq(1, 2, length = 2),
+                         nbcores = min(2, parallel::detectCores(logical = FALSE)))
+{
+  # Load necessary packages
+  library(parallel)
+  
+  # Check 'x' parameter
+  if (missing(x)) {
+    stop("The 'x' parameter is missing!")
+  } 
+  if (!is.matrix(x) && !is.data.frame(x)) {
+    stop(paste(sQuote("x"), "must be a matrix or data frame"))
+  }
+  
+  # Check 'nbcluster' parameter
+  if (missing(nbcluster)) {
+    stop("The 'nbcluster' parameter is missing!")
+  }
+  if (any(!is.wholenumber(nbcluster))) {
+    stop("'nbcluster' must contain only integer values!")
+  }
+  if (any(nbcluster < 1)) { 
+    stop(paste(sQuote("nbcluster"), "must be integers greater than 0!"))
+  }
+  
+  # Check 'lambda' parameter
+  if (!is.vector(lambda) || length(lambda) <= 1) { 
+    stop(paste(sQuote("lambda"), "must be a vector with length >= 2"))
+  }
+  if (any(lambda <= 0)) {
+    stop("All values in 'lambda' must be greater than 0!")
+  }
+  
+  # Check 'rho' parameter
+  if (!is.vector(rho)) { 
+    stop(paste(sQuote("rho"), "must be a vector"))
+  }
+  if (any(rho <= 0)) {
+    stop("All values in 'rho' must be greater than 0!")
+  }
+  
+  # Check 'nbcores' parameter
+  if (!is.wholenumber(nbcores) || (nbcores < 1)) {
+    stop(paste(sQuote("nbcores"), "must be an integer greater than 0"))
+  }
+  
+  # Scale the data
+  x <- scale(x)
+  n <- as.integer(nrow(x))
+  p <- as.integer(ncol(x))
+  K <- as.integer(nbcluster)
+  
+  ## Initialize OrderVariable matrix
+  OrderVariable <- matrix(NA, nrow = length(nbcluster), ncol = p)
+  
+  if (type == "lasso") {
+    # Call ClusteringEMGlasso to obtain VarRole
+    VarRole <- ClusteringEMGlasso(x, nbcluster, lambda, rho, nbcores)
+    # VarRole has dimensions (number of penalty combinations, p, number of nbcluster options)
+    
+    # Initialize Matrix0 to store counts of variable selection
+    Matrix0 <- matrix(0, nrow = length(nbcluster), ncol = p)
+    
+    for (k in seq_along(nbcluster)) {
+      # Sum over the penalty combinations for each variable
+      Matrix0[k, ] <- colSums(VarRole[, , k], na.rm = TRUE)
+    }
+    for (k in seq_along(nbcluster)) {
+      # Order variables based on their total selection counts
+      # The variables with higher counts are considered more important
+      OrderVariable[k, ] <- order(Matrix0[k, ], decreasing = TRUE)
+    }
+  } else if (type == "likelihood") {
+    # Placeholder for orderlikC function, which needs to be defined elsewhere
+    if (!exists("orderlikC")) {
+      stop("Function 'orderlikC' is not defined. Please define it before using 'type = \"likelihood\"'.")
+    }
+    for (k in seq_along(nbcluster)) {
+      OrderVariable[k, ] <- orderlikC(x, nbcluster[k], nbcores)
+    }
+  } else {
+    stop("Unknown 'type'. Please specify 'lasso' or 'likelihood'.")
+  }
+  
+  return(OrderVariable)    
+}
+is.wholenumber <- function(x, tol = .Machine$double.eps^0.5) abs(x - round(x)) < tol
+```
+
+#### Version 2
+```{r}
+# Helper function to check if a number is whole
+is.wholenumber <- function(x, tol = .Machine$double.eps^0.5) {
+  abs(x - round(x)) < tol
+}
+
+# Helper function for likelihood-based ordering
+orderlikC <- function(x, k, nbcores) {
+  # Initialize parameters
+  init <- InitParameter(x, k, n.start = 250, small.pen = 0.5)
+  n <- nrow(x)
+  p <- ncol(x)
+  
+  # Calculate likelihood contribution for each variable
+  var_contributions <- numeric(p)
+  
+  for(j in 1:p) {
+    # Calculate likelihood with and without variable j
+    full_data <- x
+    reduced_data <- x[, -j, drop = FALSE]
+    
+    # Fit models and compute likelihoods
+    full_fit <- try({
+      penalized_EM(full_data, k, lambda = 0, rho = 0, 
+                   init_P = init, full_res = TRUE)
+    }, silent = TRUE)
+    
+    reduced_fit <- try({
+      penalized_EM(reduced_data, k, lambda = 0, rho = 0,
+                   init_P = init, full_res = TRUE)
+    }, silent = TRUE)
+    
+    # Compute likelihood difference
+    if(!inherits(full_fit, "try-error") && !inherits(reduced_fit, "try-error")) {
+      var_contributions[j] <- full_fit$PenLogLik - reduced_fit$PenLogLik
+    }
+  }
+  
+  # Return ordered indices
+  order(var_contributions, decreasing = TRUE)
+}
+
+SortvarClust <- function(x,
+                        nbcluster,
+                        type = "lasso",
+                        lambda = seq(20, 100, by = 10),
+                        rho = seq(1, 2, length = 2),
+                        nbcores = min(2, parallel::detectCores(all.tests = FALSE, logical = FALSE))) {
+  
+  # Input validation
+  if(missing(x)) {
+    stop("x is missing!")
+  } 
+  if(!is.matrix(x) && !is.data.frame(x)) {
+    stop(paste(sQuote("x"), "must be a matrix"))
+  }
+  
+  # Convert to matrix if data.frame
+  x <- as.matrix(x)
+  
+  # Validate nbcluster
+  if(missing(nbcluster)) {
+    stop("nbcluster is missing!")
+  }
+  if(any(!is.wholenumber(nbcluster))) {
+    stop("nbcluster must contain only integer!")
+  }
+  if(any(nbcluster < 1)) { 
+    stop(paste(sQuote("nbcluster"), "must be an integer greater than 0!"))
+  }
+  
+  # Validate lambda
+  if(!is.vector(lambda) || length(lambda) <= 1) { 
+    stop(paste(sQuote("lambda"), "must be a vector with length >= 2"))
+  }
+  if(any(lambda <= 0)) {
+    stop("lambda must be greater than 0!")
+  }
+  
+  # Validate rho
+  if(!is.vector(rho)) { 
+    stop(paste(sQuote("rho"), "must be a vector"))
+  }
+  if(any(rho <= 0)) {
+    stop("rho must be greater than 0!")
+  }
+  
+  # Validate nbcores
+  if(!is.numeric(nbcores) || nbcores < 1) {
+    stop(paste(sQuote("nbcores"), "must be an integer > 0"))
+  }
+  
+  # Scale the data
+  x <- scale(x)
+  n <- as.integer(nrow(x))
+  p <- as.integer(ncol(x))
+  K <- as.integer(nbcluster)
+  
+  # Initialize output matrix
+  OrderVariable <- matrix(NA, nrow = length(nbcluster), ncol = p)
+  
+  # LASSO-based variable ordering
+  if(type == "lasso") {
+    VarRole <- array(NA, dim = c((length(lambda) * length(rho)), p, length(nbcluster)))
+    VarRole <- ClusteringEMGlasso(x, nbcluster, lambda, rho, nbcores)
+    
+    # Calculate variable importance scores
+    Matrix0 <- matrix(0, nrow = length(nbcluster), ncol = p)
+    for(k in 1:length(nbcluster)) {
+      Matrix0[k,] <- colSums(VarRole[,,k])
+    }
+    
+    # Order variables by importance
+    for(k in 1:length(nbcluster)) {
+      OrderVariable[k,] <- order(Matrix0[k,], decreasing = TRUE)
+    }
+  }
+  
+  # Likelihood-based variable ordering
+  if(type == "likelihood") {
+    for(k in 1:length(nbcluster)) {
+      OrderVariable[k,] <- orderlikC(x, nbcluster[k], nbcores)
+    }
+  }
+  
+  # Add attributes for consistency
+  attr(OrderVariable, "type") <- type
+  attr(OrderVariable, "nbcluster") <- nbcluster
+  if(type == "lasso") {
+    attr(OrderVariable, "lambda") <- lambda
+    attr(OrderVariable, "rho") <- rho
+  }
+  
+  return(OrderVariable)
+}
+
+```
+
+
+## Simulated data
+### Maugis 2019
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Number of observations and variables
+n <- 2000
+p <- 14
+
+# Generate cluster labels (1 to 4) equally likely
+clusters <- sample(1:4, n, replace = TRUE)
+
+# Define cluster parameters with diagonal covariance structure
+# Only V1 and V2 contain clustering information
+cluster_params <- list(
+  list(
+    mean = c(0, 0),
+    cov = diag(c(0.5, 0.3))
+  ),
+  list(
+    mean = c(4, 0),
+    cov = diag(c(1.5, 0.4))
+  ),
+  list(
+    mean = c(0, 2),
+    cov = diag(c(0.4, 1.5))
+  ),
+  list(
+    mean = c(4, 2),
+    cov = diag(c(2.0, 1.8))
+  )
+)
+
+# Initialize matrix for first two variables (RELEVANT for clustering)
+y1_2 <- matrix(0, nrow = n, ncol = 2)
+
+# Generate y1 and y2 based on cluster assignments
+for (k in 1:4) {
+  idx <- which(clusters == k)
+  n_k <- length(idx)
+  if (n_k > 0) {
+    y1_2[idx, ] <- mvrnorm(n_k, 
+                          mu = cluster_params[[k]]$mean, 
+                          Sigma = cluster_params[[k]]$cov)
+  }
+}
+
+# Parameters for variables 3 to 11 (IRRELEVANT for clustering)
+# These variables depend on V1 and V2 but don't contain additional clustering information
+intercepts <- c(0, 0, seq(0.4, 2.8, by = 0.4))
+b <- matrix(c(
+  0.5,  1.0,    
+  2.0,  0.0,
+  0.0,  3.0,
+  1.0,  2.0,
+  2.0,  0.0,
+  0.5,  0.0,
+  4.0,  0.5,
+  3.0,  0.0,
+  2.0,  1.0
+), nrow = 9, byrow = TRUE)
+
+# Generate epsilon with diagonal covariance
+# Large enough variance to mask any potential clustering information
+var_scale <- rep(2.0, 9)  # Large variance to ensure no clustering information
+Omega <- diag(var_scale)
+
+# Generate epsilon
+epsilon <- mvrnorm(n, mu = rep(0, 9), Sigma = Omega)
+
+# Compute y_{3:11} = b * y1_2 + intercepts + epsilon
+# These variables depend on y1_2 but don't contain clustering information
+predicted <- t(b %*% t(y1_2))
+predicted <- sweep(predicted, 2, intercepts, "+")
+y3_11 <- predicted + epsilon
+
+# Generate y_{12:14} as pure noise variables (IRRELEVANT and INDEPENDENT)
+y12_14 <- matrix(0, nrow = n, ncol = 3)
+y12_14[,1] <- rnorm(n, sd = 1.0)
+y12_14[,2] <- rnorm(n, sd = 1.0)
+y12_14[,3] <- rnorm(n, sd = 1.0)
+
+# Assemble the full dataset
+data <- cbind(y1_2, y3_11, y12_14)
+
+# Assign column names
+colnames(data) <- paste0("V", 1:14)
+
+# Add true cluster labels as attribute
+attr(data, "true_clusters") <- clusters
+
+data_missing <- produce_NA(data, mechanism = "MAR", perc.missing = 0.1)
+```
+
+```{r}
+model <- clusterDiagGaussian(data=data, nbCluster=4
+                            , models=c( "gaussian_pk_sjk")
+                            , strategy = quick_precise_strategy,
+                            criterion="BIC")
+model2 <- mixmodCluster(as.data.frame(data), 4)
+```
+
+### Testing functionality
+
+```{r, warning=FALSE, message=FALSE}
+result <- SortvarClust(data, 4)
+K <- 4
+
+# Apply the penalized EM algorithm
+lambda <- 0.1  # Penalty for means
+rho <- 0.1     # Penalty for precision matrices
+
+result <- penalized_EM(data, K = K, lambda = lambda, rho = rho, max_iter = 100, tol = 1e-4)
+
+# View the results
+print("Variable Roles (1: active, 0: inactive):")
+print(result$variable_roles)
+
+print("Means of clusters:")
+print(result$Mu)
+
+print("Penalized Log-Likelihood:")
+print(result$PenLogLik)
+```
+
+
+```{r}
+result <- SelvarClustLasso(x=data, nbcluster=2:6)
+
+result
+
+result2 <- clustvarsel(data, G=2:6, search="greedy",
+                       direction = "backward", emModels1 = "V", 
+                       emModels2 = "VVI", allow.EEE = FALSE, forcetwo = FALSE)
+```
