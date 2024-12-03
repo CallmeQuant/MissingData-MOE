@@ -14,7 +14,7 @@ install.packages(path/to/.tar.gzfile, repos = NULL, type = "source")
 
 ### Important Notes:
 
-- **Correct File Path**: Make sure to adjust `"path/to/.tar.gzfile"` to the actual location of the `.tar.gz` file on your local system. The file path you provide should point directly to where you saved the package locally.
+- **Correct File Path**: Make sure to adjust `"path/to.tar.gzfile"` to the actual location of the `.tar.gz` file on your local system. The file path you provide should point directly to where you saved the package locally.
   
   For example:
   - If the file is saved in `C:/Users/username/Documents/`, update the command as follows:
