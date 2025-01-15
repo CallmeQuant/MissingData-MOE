@@ -245,21 +245,37 @@ quick_precise_strategy <- clusterStrategy(
   longEpsilon = 1e-7
 )
 
+# rep_mixmod_strategy <- clusterStrategy(
+#   nbTry = 1, #1
+#   nbInit = 100, #50
+#   initMethod = "random",
+#   initAlgo = "EM",
+#   nbInitIteration = 20, #5
+#   initEpsilon = 0.01,
+#   nbShortRun = 5,
+#   shortRunAlgo = "EM",
+#   nbShortIteration = 100,
+#   shortEpsilon = 1e-4,
+#   longRunAlgo = "EM",
+#   nbLongIteration =200,
+#   longEpsilon = 1e-7
+# )
+
 rep_mixmod_strategy <- clusterStrategy(
-  nbTry = 1, #1
-  nbInit = 100, #50
-  initMethod = "random",
-  initAlgo = "EM",
-  nbInitIteration = 20, #5
-  initEpsilon = 0.01,
-  nbShortRun = 5,
+  nbTry = 1,
+  nbInit = 100,
+  initMethod = "class",
+  initAlgo = "SEM",
+  nbInitIteration = 10,
+  initEpsilon = 1e-4,
+  nbShortRun = 10,
   shortRunAlgo = "EM",
   nbShortIteration = 100,
-  shortEpsilon = 1e-4,
+  shortEpsilon = 1e-7,
   longRunAlgo = "EM",
-  nbLongIteration =200,
-  longEpsilon = 1e-7
-)
+  nbLongIteration = 200,
+  longEpsilon = 1e-8
+  )
 
 rep_mixmod_strategy_long <- clusterStrategy(
   nbTry = 2, #1
@@ -1854,6 +1870,7 @@ print(frequency_plot)
 ``` 
 
 ## Full analysis
+### First trial 
 ```{r}
 set.seed(123)
 
@@ -2304,7 +2321,7 @@ saveRDS(results_tibble,
 
 ```
 
-
+### Second trial 
 ```{r}
 set.seed(123)
 
@@ -2316,13 +2333,13 @@ true_S <- list(
   "Dataset_2" = c("1", "2")
 )
 true_num_clusters <- list(
-  "Dataset_1" = 3,
-  "Dataset_2" = 2
+  "Dataset_1" = 4,
+  "Dataset_2" = 4
 )
 
-hsize_per_dataset <- c(2, 3)
+hsize_per_dataset <- c(2, 2)
 missing_rates <- c(0, 0.01, 0.05, 0.1, 0.15, 0.2)
-n_runs <- 20
+n_runs <- 10
 models <- c("SelvarClustLasso", "Clustvarsel")
 
 # Initialize sensitivity_results
@@ -2374,7 +2391,8 @@ for (run_idx in 1:n_runs) {
     fixed_hsize <- hsize_per_dataset[dat_idx]
     dataset_name <- paste0("Dataset_", dat_idx)
     
-    cat("\nProcessing", dataset_name, "with", num_vars, "variables. Fixed hsize =", fixed_hsize, "\n")
+    cat("\nProcessing", dataset_name, "with", num_vars, 
+        "variables. Fixed hsize =", fixed_hsize, "\n")
     
     for (miss_idx in seq_along(missing_rates)) {
       miss_rate <- missing_rates[miss_idx]
@@ -2673,8 +2691,8 @@ results_tibble <- transform_sensitivity_results(
   true_S
 )
 
-saveRDS(results_tibble, file = "sensitivity_results/aggregated_results_20_runs.rds")
-write.csv(results_tibble, file = "sensitivity_results/aggregated_results_20_runs.csv", row.names = FALSE)
+# saveRDS(results_tibble, file = "sensitivity_results/aggregated_results_20_runs.rds")
+# write.csv(results_tibble, file = "sensitivity_results/aggregated_results_20_runs.csv", row.names = FALSE)
 print(results_tibble)
 ```
 
@@ -2682,7 +2700,7 @@ print(results_tibble)
 
 ## Consistency
 ```{r}
-n_runs <- 20 
+n_runs <- 5
 # True values
 true_clusters <- 4
 true_relevant_vars <- c(1, 2)
@@ -2692,9 +2710,15 @@ correct_variable_count <- 0
 
 for (i in seq_len(n_runs)) {
   # Run SelvarClustLasso
-  result <- SelvarClustLasso(x = data_list[[8]], 
+  data_missing <- produce_NA(data_list[[8]], mechanism = "MAR", 
+                           perc.missing = 0.15)$data.incomp
+  result <- SelvarClustLasso(x = data_missing, 
                              nbcluster = 2:4,
-                             rmodel = c("LB", "LI"))
+                             rmodel = c("LB", "LI"), 
+                             hsize = 2,
+                             nbcores = min(6, detectCores(logical = TRUE)),
+                             impute_missing = TRUE,
+                             scale_data = TRUE)
   
   chosen_clusters <- result$nbcluster
   chosen_variables <- result$S
@@ -2733,20 +2757,20 @@ full_res_df <- readRDS("result\\maugis_2012\\compare_full_res_sim_data_2012_miss
 ### MixAll vs Mixmod
 ```{r}
 rep_mixmod_strategy <- clusterStrategy(
-  nbTry = 1, #1
-  nbInit = 50, #50
+  nbTry = 1,
+  nbInit = 100,
   initMethod = "class",
-  initAlgo = "SEM",
-  nbInitIteration = 5, #5
+  initAlgo = init_algo,
+  nbInitIteration = 10,
   initEpsilon = 1e-4,
-  nbShortRun = 5, # 5
+  nbShortRun = 10,
   shortRunAlgo = "EM",
   nbShortIteration = 100,
-  shortEpsilon = 1e-6,
+  shortEpsilon = 1e-7,
   longRunAlgo = "EM",
-  nbLongIteration =200,
-  longEpsilon = 1e-7
-)
+  nbLongIteration = 200,
+  longEpsilon = 1e-8
+  )
 
 model <- clusterDiagGaussian(data=data_list$Scenario_6, nbCluster=2:4
                             , models=c( "gaussian_pk_sjk")
@@ -2757,24 +2781,25 @@ model2 <- mixmodCluster(as.data.frame(data_list$Scenario_6), 2:4,
                         models=mixmodGaussianModel(family = "diagonal"))
 ```
 
+
 ### Compare clustering strategy
 ```{r}
 # Function to run clustering with specific strategy parameters
 run_clustering <- function(data, init_method, init_algo, num_clusters = 2:4) {
   rep_mixmod_strategy <- clusterStrategy(
-    nbTry = 1,
+    nbTry = 2,
     nbInit = 50,
     initMethod = init_method,
     initAlgo = init_algo,
-    nbInitIteration = 5,
+    nbInitIteration = 10,
     initEpsilon = 1e-4,
-    nbShortRun = 5,
+    nbShortRun = 10,
     shortRunAlgo = "EM",
     nbShortIteration = 100,
-    shortEpsilon = 1e-6,
+    shortEpsilon = 1e-7,
     longRunAlgo = "EM",
     nbLongIteration = 200,
-    longEpsilon = 1e-7
+    longEpsilon = 1e-8
   )
   
   model <- clusterDiagGaussian(
@@ -2880,4 +2905,88 @@ running_times_df <- data.frame(
   ))
 
 # saveRDS(running_times_df, "running_times_comparison_2019.rds")
+```
+
+
+## MNAR
+
+```{r}
+data_missing <- produce_NA(data_list[[8]], mechanism = "MNAR", 
+                           perc.missing = 0.2)$data.incomp
+
+result <- SelvarClustLasso(
+  x = data_missing, 
+  nbcluster = 2:4,
+  rmodel = c("LB", "LI"), 
+  hsize = 2,
+  nbcores = detectCores(logical = TRUE),
+  impute_missing = TRUE,
+  scale_data = TRUE
+)
+
+data_imputed <- missRanger(data_missing)
+result2 <-clustvarsel(data_imputed, G=2:4, search="greedy",
+                          direction = "backward", emModels1 = "V", 
+                          emModels2 = "VVI", allow.EEE = FALSE, 
+                          forcetwo = FALSE, parallel = TRUE)
+
+
+predicted_labels1 <- result$partition
+predicted_labels2 <- result2$model$classification
+imputed_data1 <- result$imputedData
+data_imputed <- as.matrix(data_imputed)
+
+similarity_metrics1 <- clustComp(cluster_assignments, predicted_labels1)
+similarity_metrics2 <- clustComp(cluster_assignments, predicted_labels2)
+
+# Compute Metrics for SelvarClustLasso
+nrmse1 <- compute_nrmse(original_data = data_list[[8]], 
+                        missing_data = data_missing, 
+                        imputed_data = imputed_data1, 
+                        normalization = "missing")
+
+wnrmse1 <- compute_weighted_nrmse(original_data = data_list[[8]], 
+                       missing_data = data_missing, 
+                       imputed_data = imputed_data1, 
+                       true_labels = cluster_assignments,
+                       normalization = "missing")
+
+ciie1 <- compute_ciie(original_data = data_list[[8]], 
+                       missing_data = data_missing, 
+                       imputed_data = imputed_data1, 
+                       true_labels = cluster_assignments, 
+                       predicted_labels = predicted_labels1, 
+                       normalization = "missing", 
+                       alpha = 0.5, 
+                       beta = 0.5)
+
+# Compute Metrics for clustvarsel
+nrmse2 <- compute_nrmse(original_data = data_list[[8]], 
+                        missing_data = data_missing, 
+                        imputed_data = data_imputed, 
+                        normalization = "missing")
+
+wnrmse2 <- compute_weighted_nrmse(original_data = data_list[[8]], 
+                       missing_data = data_missing, 
+                       imputed_data = data_imputed, 
+                       true_labels = cluster_assignments, 
+                       normalization = "missing")
+
+ciie2 <- compute_ciie(original_data = data_list[[8]], 
+                       missing_data = data_missing, 
+                       imputed_data = data_imputed, 
+                       true_labels = cluster_assignments, 
+                       predicted_labels = predicted_labels2, 
+                       normalization = "missing", 
+                       alpha = 0.5, 
+                       beta = 0.5)
+
+metrics_summary <- data.frame(
+  Method = c("SelvarClustLasso", "clustvarsel"),
+  NRMSE = c(round(nrmse1, 4), round(nrmse2, 4)),
+  WNRMSE = c(round(wnrmse1, 4), round(wnrmse2, 4)),
+  CIIE = c(round(ciie1, 4), round(ciie2, 4))
+)
+
+print(metrics_summary)
 ```
