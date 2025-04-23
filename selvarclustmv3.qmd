@@ -17,33 +17,38 @@ format:
     number-depth: 3
 ---
 Progress:
--10-12-2024
- + No missing values handle => Ranking fails
- + If variability not large, scaling no too affected
+-7-2-2025:
+ + Incorporate MNARz into the framework is not straightforward
+   - Full integration => rewrite from the start
+   
+ + Current approach: Correction step 
+   - Partly introduce the MNARz in the final step 
+   - Update missing values and resp based on mechanism parameter (alpha)
+   - Only use relevant set S for updating => only missing values on these variables will be adjusted 
+   
+ + Results: Not good 
+ 
 
--2-1-2024
- + Sensitivity runs time: 17.39 hours
- + Average time per run: 52.18 minutes
  
  
  
   
 
 ```{r}
-# create_package_tarball <- function(path) {
-#   Rcpp::compileAttributes(path)
-# 
-#   pkg_name <- basename(path)
-# 
-#   parent_dir <- dirname(path)
-# 
-#   devtools::build(path, path = parent_dir, binary = FALSE)
-# }
-# tar_filename <- "D:/RProject/SelvarMix_1.2.1.tar.gz"
-# if (!file.exists(tar_filename)) {
-#   create_package_tarball("D:/Rproject/SelvarMix_extend")
-# }
-# install.packages("D:/RProject/SelvarMix_1.2.1.tar.gz", repos = NULL, type="source")
+create_package_tarball <- function(path) {
+  Rcpp::compileAttributes(path)
+
+  pkg_name <- basename(path)
+
+  parent_dir <- dirname(path)
+
+  devtools::build(path, path = parent_dir, binary = FALSE)
+}
+tar_filename <- "D:/RProject/SelvarMix_1.2.1.tar.gz"
+if (!file.exists(tar_filename)) {
+  create_package_tarball("D:/Rproject/SelvarMix_extend")
+}
+install.packages("D:/RProject/SelvarMix_1.2.1.tar.gz", repos = NULL, type="source")
 ```
 
 ## Loading libraries
@@ -52,15 +57,10 @@ rm(list=ls())
 library(here)
 library(Gmisc)
 library(glasso)
-library(MixAll)
-library(Rmixmod)
-library(MASS)
-library(mclust)
+
 library(mvtnorm)
 library(Matrix)
-library(clustvarsel)
 library(stats)
-library(VarSelLCM)
 library(BMA)
 library(mlogitBMA)
 library(mlogit)
@@ -71,10 +71,24 @@ library(iterators)
 library(reshape2)
 library(ggplot2)
 library(tidyverse)
-library(SelvarMix)
 library(matrixStats)  # For efficient matrix operations
 library(aricode) # For efficient similarity metrics between two classification
 source("amputation.R")
+
+# MixAll and SelvarMix
+library(SelvarMix)
+library(MixAll)
+
+# Benchmarks 
+library(VarSelLCM)
+library(RMixtComp)
+library(Rmixmod)
+library(clustvarsel)
+library(mclust)
+library(MASS)
+source("EM_Gaussian_withoutNA.R")
+source("EM_Gaussian.R")
+source("Functions_misspecification.R")
 ```
 
 
@@ -361,7 +375,6 @@ tilde_alpha <- c(0, 0, seq(0.4, 4, by = 0.4))
 
 # Initialize lists to store datasets and results
 data_list <- list()
-results_list <- list()
 
 # Define scenario-specific parameters
 for (scenario in 1:8) {
@@ -881,7 +894,8 @@ result <- SelvarClustLasso(
   hsize = 2,
   nbcores = detectCores(logical = TRUE),
   impute_missing = TRUE,
-  scale_data = TRUE
+  scale_data = TRUE,
+  use_missing_pattern = FALSE
 )
 
 data_imputed <- missRanger(data_missing)
@@ -1870,734 +1884,165 @@ print(frequency_plot)
 ``` 
 
 ## Full analysis
-### Second trial 
-```{r}
-set.seed(123)
-
-# Initialize parameters
-data_sen <- list(data, data_list[[8]])
-data_sen_labels <- list(component, cluster_assignments) 
-true_S <- list(
-  "Dataset_1" = c("1", "2", "3"),
-  "Dataset_2" = c("1", "2")
-)
-true_num_clusters <- list(
-  "Dataset_1" = 4,
-  "Dataset_2" = 4
-)
-
-hsize_per_dataset <- c(2, 2)
-missing_rates <- c(0, 0.01, 0.05, 0.1, 0.15, 0.2)
-n_runs <- 10
-models <- c("SelvarClustLasso", "Clustvarsel")
-
-# Initialize sensitivity_results
-sensitivity_results <- vector("list", length(data_sen))
-names(sensitivity_results) <- paste0("Dataset_", seq_along(data_sen))
-for(i in seq_along(data_sen)) {
-  sensitivity_results[[i]] <- vector("list", length(missing_rates))
-  names(sensitivity_results[[i]]) <- paste0("MissingRate_", missing_rates)
-  for(j in seq_along(missing_rates)) {
-    sensitivity_results[[i]][[j]] <- vector("list", length(models))
-    names(sensitivity_results[[i]][[j]]) <- models
-    for(m in seq_along(models)) {
-      sensitivity_results[[i]][[j]][[m]] <- vector("list", n_runs)
-      names(sensitivity_results[[i]][[j]][[m]]) <- paste0("Run_", 1:n_runs)
-    }
-  }
-}
-
-# Initialize timing_results
-timing_results <- data.frame(
-  Dataset = character(),
-  Missing_Rate = numeric(),
-  Model = character(),
-  Run = numeric(),
-  Run_Time_Seconds = numeric(),
-  stringsAsFactors = FALSE
-)
-
-# Create results directory
-dir.create("sensitivity_results", showWarnings = FALSE)
-
-# Set number of cores
-total_cores <- detectCores(logical = TRUE)
-nbcores_to_use <- min(6, total_cores - 1)
-cat("Using", nbcores_to_use, "cores for computation\n")
-
-# Start total simulation time
-total_start_time <- Sys.time()
-
-# Simulation runs
-for (run_idx in 1:n_runs) {
-  cat("\n=== Starting Run", run_idx, "===\n")
-  run_start_time <- Sys.time()
-  
-  for (dat_idx in seq_along(data_sen)) {
-    current_data <- data_sen[[dat_idx]]
-    current_labels <- data_sen_labels[[dat_idx]]
-    num_vars <- ncol(current_data)
-    fixed_hsize <- hsize_per_dataset[dat_idx]
-    dataset_name <- paste0("Dataset_", dat_idx)
-    
-    cat("\nProcessing", dataset_name, "with", num_vars, 
-        "variables. Fixed hsize =", fixed_hsize, "\n")
-    
-    for (miss_idx in seq_along(missing_rates)) {
-      miss_rate <- missing_rates[miss_idx]
-      cat("\n  Missing Rate:", miss_rate, "\n")
-      
-      for (m in seq_along(models)) {
-        model_name <- models[m]
-        cat("    Processing Model:", model_name, "\n")
-        
-        result_file <- file.path(
-          "sensitivity_results", 
-          paste0(
-            "dataset_", dat_idx, 
-            "_miss_", miss_rate, 
-            "_model_", model_name, 
-            "_run_", run_idx, 
-            "_results.rds"
-          )
-        )
-        
-        if (file.exists(result_file)) {
-          cat("      Loading existing results for Run", run_idx, "Model", model_name, "\n")
-          sensitivity_results[[dat_idx]][[miss_idx]][[model_name]][[run_idx]] <- readRDS(result_file)
-          next
-        }
-        
-        tryCatch({
-          if (miss_rate == 0) {
-            data_missing <- current_data
-          } else {
-            data_missing <- produce_NA(current_data, 
-                                       mechanism = "MAR", 
-                                       perc.missing = miss_rate)$data.incomp
-          }
-          
-          if (model_name == "SelvarClustLasso") {
-            selvar_start_time <- Sys.time()
-            selvar_result <- SelvarClustLasso(
-              x = data_missing, 
-              nbcluster = 2:4,
-              rmodel = c("LB", "LI"), 
-              hsize = fixed_hsize, 
-              nbcores = nbcores_to_use,
-              impute_missing = (miss_rate > 0),
-              scale_data = TRUE
-            )
-            selvar_time <- as.numeric(difftime(Sys.time(), selvar_start_time, units = "secs"))
-            
-            imputed_data <- selvar_result$imputedData
-            predicted_labels <- selvar_result$partition
-            
-            ari <- tryCatch({
-              adjustedRandIndex(current_labels, predicted_labels)
-            }, error = function(e) { NA })
-            
-            nrmse <- tryCatch({
-              compute_nrmse(
-                original_data = current_data, 
-                missing_data = data_missing, 
-                imputed_data = imputed_data, 
-                normalization = "missing"
-              )
-            }, error = function(e) { NA })
-            
-            w_nrmse <- tryCatch({
-              compute_weighted_nrmse(
-                original_data = current_data, 
-                missing_data = data_missing, 
-                imputed_data = imputed_data, 
-                true_labels = current_labels,
-                normalization = "missing"
-              )
-            }, error = function(e) { NA })
-            
-            ciie <- tryCatch({
-              compute_ciie(
-                original_data = current_data, 
-                missing_data = data_missing, 
-                imputed_data = imputed_data, 
-                true_labels = current_labels, 
-                predicted_labels = predicted_labels, 
-                normalization = "missing", 
-                alpha = 0.4, 
-                beta = 0.6
-              )
-            }, error = function(e) { NA })
-            
-            result <- data.frame(
-              Run = run_idx,
-              Dataset = dataset_name,
-              Missing_Rate = miss_rate,
-              Model = model_name,
-              HSize = fixed_hsize,
-              Num_Variables = num_vars,
-              Method = "SelvarClustLasso",
-              NRMSE = round(nrmse, 4),
-              WNRMSE = round(w_nrmse, 4),
-              CIIE = round(ciie, 4),
-              BIC = selvar_result$criterionValue,
-              Num_Clusters = selvar_result$nbcluster,  
-              Relevant_Variables = paste(selvar_result$S, collapse = ", "),
-              ARI = round(ari, 4),
-              Run_Time_Seconds = round(selvar_time, 2),
-              stringsAsFactors = FALSE
-            )
-            
-          } else if (model_name == "Clustvarsel") {
-            clust_start_time <- Sys.time()
-            if (miss_rate == 0) {
-              data_imputed <- data_missing
-            } else {
-              data_imputed <- missRanger(data_missing)
-            }
-            
-            clust_result <- clustvarsel(
-              data_imputed, 
-              G = 2:4, 
-              search = "greedy",
-              direction = "backward", 
-              emModels1 = "V",
-              emModels2 = "VVI", 
-              allow.EEE = FALSE,
-              forcetwo = FALSE, 
-              parallel = FALSE
-            )
-            
-            clust_time <- as.numeric(difftime(Sys.time(), clust_start_time, units = "secs"))
-            
-            imputed_data <- data_imputed
-            predicted_labels <- clust_result$model$classification
-            
-            ari <- tryCatch({
-              adjustedRandIndex(current_labels, predicted_labels)
-            }, error = function(e) { NA })
-            
-            nrmse <- tryCatch({
-              compute_nrmse(
-                original_data = current_data, 
-                missing_data = data_missing, 
-                imputed_data = imputed_data, 
-                normalization = "missing"
-              )
-            }, error = function(e) { NA })
-            
-            w_nrmse <- tryCatch({
-              compute_weighted_nrmse(
-                original_data = current_data, 
-                missing_data = data_missing, 
-                imputed_data = imputed_data, 
-                true_labels = current_labels,
-                normalization = "missing"
-              )
-            }, error = function(e) { NA })
-            
-            ciie <- tryCatch({
-              compute_ciie(
-                original_data = current_data, 
-                missing_data = data_missing, 
-                imputed_data = imputed_data, 
-                true_labels = current_labels, 
-                predicted_labels = predicted_labels, 
-                normalization = "missing", 
-                alpha = 0.4, 
-                beta = 0.6
-              )
-            }, error = function(e) { NA })
-            
-            result <- data.frame(
-              Run = run_idx,
-              Dataset = dataset_name,
-              Missing_Rate = miss_rate,
-              Model = model_name,
-              HSize = fixed_hsize,
-              Num_Variables = num_vars,
-              Method = "Clustvarsel",
-              NRMSE = round(nrmse, 4),
-              WNRMSE = round(w_nrmse, 4),
-              CIIE = round(ciie, 4),
-              BIC = clust_result$model$bic,
-              Num_Clusters = clust_result$model$G,  
-              Relevant_Variables = paste(clust_result$subset, collapse = ", "),
-              ARI = round(ari, 4),
-              Run_Time_Seconds = round(clust_time, 2),
-              stringsAsFactors = FALSE
-            )
-          }
-          
-          timing_results <- rbind(timing_results, data.frame(
-            Dataset = dataset_name,
-            Missing_Rate = miss_rate,
-            Model = model_name,
-            Run = run_idx,
-            Run_Time_Seconds = result$Run_Time_Seconds,
-            stringsAsFactors = FALSE
-          ))
-          
-          sensitivity_results[[dat_idx]][[miss_idx]][[model_name]][[run_idx]] <- result
-          saveRDS(result, file = result_file)
-          
-          cat("      Saved results for Run", run_idx, "Model", model_name, "\n")
-          print(result)
-          cat("      Completed in", round(result$Run_Time_Seconds, 2), "seconds\n")
-          
-          rm(data_missing, selvar_result, clust_result, data_imputed, imputed_data, predicted_labels, result)
-          gc()
-          
-        }, error = function(e) {
-          cat("      Error in Run", run_idx, "Model", model_name, ":", conditionMessage(e), "\n")
-        })
-      }
-    }
-  }
-  
-  run_time <- as.numeric(difftime(Sys.time(), run_start_time, units = "secs"))
-  cat("=== Completed Run", run_idx, "in", round(run_time, 2), "seconds ===\n")
-}
-
-total_time <- as.numeric(difftime(Sys.time(), total_start_time, units = "secs"))
-cat("\nTotal simulation time:", round(total_time, 2), "seconds\n")
-
-# Transform and aggregate results
-transform_sensitivity_results <- function(sensitivity_results, 
-                                          timing_results,
-                                          n_runs, 
-                                          true_num_clusters,
-                                          true_relevant_vars) {
-  all_results <- list()
-  for(dat_idx in seq_along(sensitivity_results)) {
-    dataset_results <- sensitivity_results[[dat_idx]]
-    dataset_name <- names(sensitivity_results)[dat_idx]
-    for(miss_idx in seq_along(dataset_results)) {
-      missing_rate_results <- dataset_results[[miss_idx]]
-      for(m in names(missing_rate_results)) {
-        model_results <- missing_rate_results[[m]]
-        for(run in seq_along(model_results)) {
-          result <- model_results[[run]]
-          if(!is.null(result)) {
-            all_results[[length(all_results) + 1]] <- result
-          }
-        }
-      }
-    }
-  }
-  
-  results_tibble <- bind_rows(all_results) |>
-    mutate(across(c(Dataset, Model, Method, Relevant_Variables), as.factor)) |>
-    mutate(across(c(Num_Variables, Missing_Rate, HSize, 
-                   NRMSE, WNRMSE, CIIE, BIC, 
-                   Num_Clusters, ARI, Run_Time_Seconds), as.numeric)) |>
-    mutate(
-      Correct_Variables = map2_int(Dataset, Relevant_Variables, ~ {
-        true_vars <- true_relevant_vars[[as.character(.x)]]
-        selected_vars <- str_split(as.character(.y), ",\\s*")[[1]]
-        if(length(selected_vars) != length(true_vars)) {
-          return(0)
-        } else {
-          return(all(sort(selected_vars) == sort(true_vars)) * 1)
-        }
-      })
-    ) |>
-    mutate(
-      Correct_Clusters = mapply(function(dataset, clusters) {
-        clusters == true_num_clusters[[dataset]]
-      }, Dataset, Num_Clusters)
-    )
-  
-  freq_cluster <- results_tibble |>
-    group_by(Dataset, Missing_Rate, Model, HSize, Method) |>
-    summarise(
-      Avg_NRMSE = mean(NRMSE, na.rm = TRUE),
-      SD_NRMSE = sd(NRMSE, na.rm = TRUE),
-      Avg_WNRMSE = mean(WNRMSE, na.rm = TRUE),
-      SD_WNRMSE = sd(WNRMSE, na.rm = TRUE),
-      Avg_CIIE = mean(CIIE, na.rm = TRUE),
-      SD_CIIE = sd(CIIE, na.rm = TRUE),
-      Avg_BIC = mean(BIC, na.rm = TRUE),
-      SD_BIC = sd(BIC, na.rm = TRUE),
-      Avg_ARI = mean(ARI, na.rm = TRUE),
-      SD_ARI = sd(ARI, na.rm = TRUE),
-      freq_num_cluster = sum(Correct_Clusters, na.rm = TRUE),
-      freq_correct_variables = sum(Correct_Variables, na.rm = TRUE),
-      Avg_Run_Time = mean(Run_Time_Seconds, na.rm = TRUE),
-      SD_Run_Time = sd(Run_Time_Seconds, na.rm = TRUE),
-      .groups = 'drop'
-    ) |>
-    arrange(Dataset, Missing_Rate, Model, HSize)
-  
-  return(freq_cluster)
-}
-
-results_tibble <- transform_sensitivity_results(
-  sensitivity_results, 
-  timing_results,
-  n_runs,
-  true_num_clusters,
-  true_S
-)
-
-# saveRDS(results_tibble, file = "sensitivity_results/aggregated_results_20_runs.rds")
-# write.csv(results_tibble, file = "sensitivity_results/aggregated_results_20_runs.csv", row.names = FALSE)
-print(results_tibble)
-```
-
 ### Parallel version
 ```{r}
 set.seed(123)
 
+# Configuration -----------------------------------------------------------
 data_sen <- list(data, data_list[[8]])
 data_sen_labels <- list(component, cluster_assignments) 
-true_S <- list(
-  "Dataset_1" = c("1", "2", "3"),
-  "Dataset_2" = c("1", "2")
-)
-true_num_clusters <- list(
-  "Dataset_1" = 4,
-  "Dataset_2" = 4
-)
-
+true_S <- list(Dataset_1 = c("1", "2", "3"), Dataset_2 = c("1", "2"))
+true_num_clusters <- list(Dataset_1 = 4, Dataset_2 = 4)
 hsize_per_dataset <- c(2, 2)
 missing_rates <- c(0, 0.01, 0.05, 0.1, 0.15, 0.2)
 n_runs <- 10
 models <- c("SelvarClustLasso", "Clustvarsel")
 
-# Create results directory
-dir.create("sensitivity_results", showWarnings = FALSE)
-
-# Set up cores 
-total_cores <- detectCores(logical = TRUE)
-nbcores_to_use <- min(6, total_cores - 1)  # 12 cores 
-cl <- makeCluster(nbcores_to_use)
+# Core setup --------------------------------------------------------------
+total_cores <- detectCores()
+available_cores <- max(1, total_cores - 2)
+cl <- makeCluster(available_cores)
 registerDoParallel(cl)
-cat("Using", nbcores_to_use, "cores for computation\n")
 
-# Start total simulation time
-total_start_time <- Sys.time()
+# Create results directory in main process and workers
+dir.create("sensitivity_results", showWarnings = FALSE)
+clusterEvalQ(cl, dir.create("sensitivity_results", showWarnings = FALSE))
 
-# Create a combined list of (run, dataset) pairs
-tasks <- expand.grid(run_idx = 1:n_runs, dat_idx = 1:length(data_sen))
+# Create parameter grid for all combinations
+task_grid <- expand.grid(
+  run_idx = 1:n_runs,
+  dat_idx = seq_along(data_sen),
+  miss_rate = missing_rates,
+  model = models
+)
 
-# Parallel simulation over combined tasks
-timing_results_list <- foreach(task = 1:nrow(tasks), .combine = rbind, 
-                               .packages = c("missRanger", "clustvarsel", 
-                                             "doParallel", "foreach", 
-                                             "stringr", "dplyr",
-                                             "SelvarMix", "aricode",
-                                             "mclust"
-                                             )) %dopar% {
-  run_idx <- tasks$run_idx[task]
-  dat_idx <- tasks$dat_idx[task]
+# Main parallel computation -----------------------------------------------
+results <- foreach(task = 1:nrow(task_grid), .combine = rbind,
+                   .packages = c("dplyr", "stringr", "missRanger", 
+                                "clustvarsel", "SelvarMix", "aricode",
+                                "mclust")) %dopar% {
   
-  # Initialize timing results for this task
-  task_timing_results <- data.frame(
-    Dataset = character(),
-    Missing_Rate = numeric(),
-    Model = character(),
-    Run = numeric(),
-    Run_Time_Seconds = numeric(),
-    stringsAsFactors = FALSE
-  )
+  # Extract parameters from task grid
+  run_idx <- task_grid$run_idx[task]
+  dat_idx <- task_grid$dat_idx[task]
+  miss_rate <- task_grid$miss_rate[task]
+  model_name <- as.character(task_grid$model[task])
   
-  cat("\n=== Starting Run", run_idx, "for Dataset", dat_idx, "===\n")
-  task_start_time <- Sys.time()
-  
+  # Dataset-specific parameters
   current_data <- data_sen[[dat_idx]]
   current_labels <- data_sen_labels[[dat_idx]]
-  num_vars <- ncol(current_data)
   fixed_hsize <- hsize_per_dataset[dat_idx]
   dataset_name <- paste0("Dataset_", dat_idx)
+  result_file <- file.path(
+    "sensitivity_results",
+    sprintf("dataset_%d_miss_%s_model_%s_run_%d.rds",
+            dat_idx, miss_rate, model_name, run_idx)
+  )
   
-  cat("\nProcessing", dataset_name, "with", num_vars, 
-      "variables. Fixed hsize =", fixed_hsize, "\n")
+  # Skip existing results
+  if (file.exists(result_file)) return(NULL)
   
-  for (miss_idx in seq_along(missing_rates)) {
-    miss_rate <- missing_rates[miss_idx]
-    cat("\n  Missing Rate:", miss_rate, "\n")
+  tryCatch({
+    # Create missing data
+    data_missing <- if (miss_rate == 0) {
+      current_data
+    } else {
+      produce_NA(current_data, mechanism = "MAR", 
+                perc.missing = miss_rate)$data.incomp
+    }
     
-    for (m in seq_along(models)) {
-      model_name <- models[m]
-      cat("    Processing Model:", model_name, "\n")
-      
-      result_file <- file.path(
-        "sensitivity_results", 
-        paste0(
-          "dataset_", dat_idx, 
-          "_miss_", miss_rate, 
-          "_model_", model_name, 
-          "_run_", run_idx, 
-          "_results.rds"
-        )
+    # Model execution
+    start_time <- Sys.time()
+    
+    if (model_name == "SelvarClustLasso") {
+      model_result <- SelvarClustLasso(
+        x = data_missing,
+        nbcluster = 2:4,
+        rmodel = c("LB", "LI"),
+        hsize = fixed_hsize,
+        nbcores = 1,
+        impute_missing = (miss_rate > 0),
+        scale_data = TRUE
       )
       
-      # Skip if result file exists
-      if (file.exists(result_file)) {
-        cat("      Loading existing results for Run", run_idx, "Model", model_name, "\n")
-        sensitivity_results[[dat_idx]][[miss_idx]][[model_name]][[run_idx]] <- readRDS(result_file)
-        next
-      }
+      imputed_data <- model_result$imputedData
+      predicted_labels <- model_result$partition
+      relevant_vars <- paste(model_result$S, collapse = ", ")
+      bic <- model_result$criterionValue
+      n_clusters <- model_result$nbcluster
       
-      tryCatch({
-        # Produce missing data if needed
-        if (miss_rate == 0) {
-          data_missing <- current_data
-        } else {
-          data_missing <- produce_NA(current_data, 
-                                     mechanism = "MAR", 
-                                     perc.missing = miss_rate)$data.incomp
-        }
-        
-        if (model_name == "SelvarClustLasso") {
-          selvar_start_time <- Sys.time()
-          selvar_result <- SelvarClustLasso(
-            x = data_missing, 
-            nbcluster = 2:4,
-            rmodel = c("LB", "LI"), 
-            hsize = fixed_hsize, 
-            nbcores = 1,
-            impute_missing = (miss_rate > 0),
-            scale_data = TRUE
-          )
-          selvar_time <- as.numeric(difftime(Sys.time(), selvar_start_time, units = "secs"))
-          
-          imputed_data <- selvar_result$imputedData
-          predicted_labels <- selvar_result$partition
-          
-          ari <- tryCatch({
-            adjustedRandIndex(current_labels, predicted_labels)
-          }, error = function(e) { NA })
-          
-          nrmse <- tryCatch({
-            compute_nrmse(
-              original_data = current_data, 
-              missing_data = data_missing, 
-              imputed_data = imputed_data, 
-              normalization = "missing"
-            )
-          }, error = function(e) { NA })
-          
-          w_nrmse <- tryCatch({
-            compute_weighted_nrmse(
-              original_data = current_data, 
-              missing_data = data_missing, 
-              imputed_data = imputed_data, 
-              true_labels = current_labels,
-              normalization = "missing"
-            )
-          }, error = function(e) { NA })
-          
-          ciie <- tryCatch({
-            compute_ciie(
-              original_data = current_data, 
-              missing_data = data_missing, 
-              imputed_data = imputed_data, 
-              true_labels = current_labels, 
-              predicted_labels = predicted_labels, 
-              normalization = "missing", 
-              alpha = 0.4, 
-              beta = 0.6
-            )
-          }, error = function(e) { NA })
-          
-          result <- data.frame(
-            Run = run_idx,
-            Dataset = dataset_name,
-            Missing_Rate = miss_rate,
-            Model = model_name,
-            HSize = fixed_hsize,
-            Num_Variables = num_vars,
-            Method = "SelvarClustLasso",
-            NRMSE = round(nrmse, 4),
-            WNRMSE = round(w_nrmse, 4),
-            CIIE = round(ciie, 4),
-            BIC = selvar_result$criterionValue,
-            Num_Clusters = selvar_result$nbcluster,  
-            Relevant_Variables = paste(selvar_result$S, collapse = ", "),
-            ARI = round(ari, 4),
-            Run_Time_Seconds = round(selvar_time, 2),
-            stringsAsFactors = FALSE
-          )
-          
-        } else if (model_name == "Clustvarsel") {
-          clust_start_time <- Sys.time()
-          if (miss_rate == 0) {
-            data_imputed <- data_missing
-          } else {
-            data_imputed <- missRanger(data_missing)
-          }
-          
-          clust_result <- clustvarsel(
-            data_imputed, 
-            G = 2:4, 
-            search = "greedy",
-            direction = "backward", 
-            emModels1 = "V",
-            emModels2 = "VVI", 
-            allow.EEE = FALSE,
-            forcetwo = FALSE, 
-            parallel = TRUE
-          )
-          
-          clust_time <- as.numeric(difftime(Sys.time(), clust_start_time, units = "secs"))
-          
-          imputed_data <- data_imputed
-          predicted_labels <- clust_result$model$classification
-          
-          ari <- tryCatch({
-            adjustedRandIndex(current_labels, predicted_labels)
-          }, error = function(e) { NA })
-          
-          nrmse <- tryCatch({
-            compute_nrmse(
-              original_data = current_data, 
-              missing_data = data_missing, 
-              imputed_data = imputed_data, 
-              normalization = "missing"
-            )
-          }, error = function(e) { NA })
-          
-          w_nrmse <- tryCatch({
-            compute_weighted_nrmse(
-              original_data = current_data, 
-              missing_data = data_missing, 
-              imputed_data = imputed_data, 
-              true_labels = current_labels,
-              normalization = "missing"
-            )
-          }, error = function(e) { NA })
-          
-          ciie <- tryCatch({
-            compute_ciie(
-              original_data = current_data, 
-              missing_data = data_missing, 
-              imputed_data = imputed_data, 
-              true_labels = current_labels, 
-              predicted_labels = predicted_labels, 
-              normalization = "missing", 
-              alpha = 0.4, 
-              beta = 0.6
-            )
-          }, error = function(e) { NA })
-          
-          result <- data.frame(
-            Run = run_idx,
-            Dataset = dataset_name,
-            Missing_Rate = miss_rate,
-            Model = model_name,
-            HSize = fixed_hsize,
-            Num_Variables = num_vars,
-            Method = "Clustvarsel",
-            NRMSE = round(nrmse, 4),
-            WNRMSE = round(w_nrmse, 4),
-            CIIE = round(ciie, 4),
-            BIC = clust_result$model$bic,
-            Num_Clusters = clust_result$model$G,  
-            Relevant_Variables = paste(clust_result$subset, collapse = ", "),
-            ARI = round(ari, 4),
-            Run_Time_Seconds = round(clust_time, 2),
-            stringsAsFactors = FALSE
-          )
-        }
-        
-        # Timing info for this run/model
-        task_timing_results <- rbind(task_timing_results, data.frame(
-          Dataset = dataset_name,
-          Missing_Rate = miss_rate,
-          Model = model_name,
-          Run = run_idx,
-          Run_Time_Seconds = result$Run_Time_Seconds,
-          stringsAsFactors = FALSE
-        ))
-        
-        # Save the result to an RDS file
-        saveRDS(result, file = result_file)
-        
-        cat("      Saved results for Run", run_idx, "Model", model_name, "\n")
-        cat("      Completed in", round(result$Run_Time_Seconds, 2), "seconds\n")
-        
-        rm(data_missing, selvar_result, clust_result, data_imputed, imputed_data, predicted_labels, result)
-        gc()
-        
-      }
+    } else if (model_name == "Clustvarsel") {
+      data_imputed <- if (miss_rate == 0) data_missing else missRanger(data_missing)
+      
+      model_result <- clustvarsel(
+        data_imputed,
+        G = 2:4,
+        search = "greedy",
+        direction = "backward",
+        emModels1 = "V",
+        emModels2 = "VVI",
+        allow.EEE = FALSE,
+        forcetwo = FALSE,
+        parallel = FALSE  
+      )
+      
+      imputed_data <- data_imputed
+      predicted_labels <- model_result$model$classification
+      relevant_vars <- paste(model_result$subset, collapse = ", ")
+      bic <- model_result$model$bic
+      n_clusters <- model_result$model$G
     }
-  
-  task_time <- as.numeric(difftime(Sys.time(), task_start_time, units = "secs"))
-  cat("=== Completed Run", run_idx, "for Dataset", dat_idx, "in", round(task_time, 2), "seconds ===\n")
-  
-  # Return timing results collected during this task
-  task_timing_results
+    
+    # Calculate metrics
+    compute_metric <- function(f) {
+      tryCatch(f(), error = function(e) NA)
+    }
+    
+    ari <- compute_metric(function() adjustedRandIndex(current_labels, predicted_labels))
+    nrmse <- compute_metric(function() compute_nrmse(current_data, data_missing, imputed_data))
+    w_nrmse <- compute_metric(function() compute_weighted_nrmse(current_data, data_missing, imputed_data, current_labels))
+    ciie <- compute_metric(function() compute_ciie(current_data, data_missing, imputed_data, current_labels, predicted_labels))
+    
+    # Create result object
+    result <- data.frame(
+      Run = run_idx,
+      Dataset = dataset_name,
+      Missing_Rate = miss_rate,
+      Model = model_name,
+      HSize = fixed_hsize,
+      Num_Variables = ncol(current_data),
+      NRMSE = round(nrmse, 4),
+      WNRMSE = round(w_nrmse, 4),
+      CIIE = round(ciie, 4),
+      BIC = round(bic, 2),
+      Num_Clusters = n_clusters,
+      Relevant_Variables = relevant_vars,
+      ARI = round(ari, 4),
+      Run_Time_Seconds = round(difftime(Sys.time(), start_time, units = "secs"), 2),
+      stringsAsFactors = FALSE
+    )
+    
+    # Save individual result
+    saveRDS(result, result_file)
+    result
+    
+  }, error = function(e) {
+    message(sprintf("Error in task %d: %s", task, conditionMessage(e)))
+    NULL
+  })
 }
 
-# Stop the cluster
+# Cleanup parallel workers
 stopCluster(cl)
 
-# Combine all timing results from parallel tasks
-timing_results <- timing_results_list
+# Post-processing ---------------------------------------------------------
+result_files <- list.files("sensitivity_results", pattern = "\\.rds$", full.names = TRUE)
+all_results <- lapply(result_files, readRDS) |> bind_rows()
 
-total_time <- as.numeric(difftime(Sys.time(), total_start_time, units = "secs"))
-cat("\nTotal simulation time:", round(total_time, 2), "seconds\n")
-
-# Post-Processing and Aggregation
-# Since results are saved as individual RDS files, you can read them as follows:
-
-# List all result files
-result_files <- list.files("sensitivity_results", pattern = "*.rds", full.names = TRUE)
-
-# Read all results into a list
-all_results <- lapply(result_files, readRDS)
-
-# Combine into a single tibble
-results_tibble <- bind_rows(all_results) %>%
-  mutate(across(c(Dataset, Model, Method, Relevant_Variables), as.factor)) %>%
-  mutate(across(c(Num_Variables, Missing_Rate, HSize, 
-                  NRMSE, WNRMSE, CIIE, BIC, 
-                  Num_Clusters, ARI, Run_Time_Seconds), as.numeric)) 
-
-# Apply the transformation and aggregation
-results_tibble <- results_tibble %>%
-  mutate(
-    Correct_Variables = map2_int(Dataset, Relevant_Variables, ~ {
-      true_vars <- true_S[[as.character(.x)]]
-      selected_vars <- str_split(as.character(.y), ",\\s*")[[1]]
-      if(length(selected_vars) != length(true_vars)) {
-        return(0)
-      } else {
-        return(all(sort(selected_vars) == sort(true_vars)) * 1)
-      }
-    })
-  ) %>%
-  mutate(
-    Correct_Clusters = mapply(function(dataset, clusters) {
-      clusters == true_num_clusters[[as.character(dataset)]]
-    }, Dataset, Num_Clusters)
-  )
-
-freq_cluster <- results_tibble %>%
-  group_by(Dataset, Missing_Rate, Model, HSize, Method) %>%
-  summarise(
-    Avg_NRMSE = mean(NRMSE, na.rm = TRUE),
-    SD_NRMSE = sd(NRMSE, na.rm = TRUE),
-    Avg_WNRMSE = mean(WNRMSE, na.rm = TRUE),
-    SD_WNRMSE = sd(WNRMSE, na.rm = TRUE),
-    Avg_CIIE = mean(CIIE, na.rm = TRUE),
-    SD_CIIE = sd(CIIE, na.rm = TRUE),
-    Avg_BIC = mean(BIC, na.rm = TRUE),
-    SD_BIC = sd(BIC, na.rm = TRUE),
-    Avg_ARI = mean(ARI, na.rm = TRUE),
-    SD_ARI = sd(ARI, na.rm = TRUE),
-    freq_num_cluster = sum(Correct_Clusters, na.rm = TRUE),
-    freq_correct_variables = sum(Correct_Variables, na.rm = TRUE),
-    Avg_Run_Time = mean(Run_Time_Seconds, na.rm = TRUE),
-    SD_Run_Time = sd(Run_Time_Seconds, na.rm = TRUE),
-    .groups = 'drop'
-  ) %>%
-  arrange(Dataset, Missing_Rate, Model, HSize)
-
-print(freq_cluster)
+saveRDS(all_results, file = "sensitivity_results/aggregated_results_10_runs.rds")
+write.csv(all_results, file = "sensitivity_results/aggregated_results_10_runs.csv", row.names = FALSE)
 ```
+
 
 ## Consistency
 ```{r}
@@ -2657,22 +2102,6 @@ full_res_df <- readRDS("result\\maugis_2012\\compare_full_res_sim_data_2012_miss
 ## Testing
 ### MixAll vs Mixmod
 ```{r}
-rep_mixmod_strategy <- clusterStrategy(
-  nbTry = 1,
-  nbInit = 100,
-  initMethod = "class",
-  initAlgo = init_algo,
-  nbInitIteration = 10,
-  initEpsilon = 1e-4,
-  nbShortRun = 10,
-  shortRunAlgo = "EM",
-  nbShortIteration = 100,
-  shortEpsilon = 1e-7,
-  longRunAlgo = "EM",
-  nbLongIteration = 200,
-  longEpsilon = 1e-8
-  )
-
 model <- clusterDiagGaussian(data=data_list$Scenario_6, nbCluster=2:4
                             , models=c( "gaussian_pk_sjk")
                             , strategy = rep_mixmod_strategy,
@@ -2810,7 +2239,7 @@ running_times_df <- data.frame(
 
 
 ## MNAR
-
+### Without C
 ```{r}
 data_missing <- produce_NA(data_list[[8]], mechanism = "MNAR", 
                            perc.missing = 0.2)$data.incomp
@@ -2822,7 +2251,8 @@ result <- SelvarClustLasso(
   hsize = 2,
   nbcores = detectCores(logical = TRUE),
   impute_missing = TRUE,
-  scale_data = TRUE
+  scale_data = TRUE,
+  use_missing_pattern = TRUE
 )
 
 data_imputed <- missRanger(data_missing)
@@ -2890,4 +2320,358 @@ metrics_summary <- data.frame(
 )
 
 print(metrics_summary)
+```
+
+### With C
+```{r}
+data_missing <- produce_NA(data_list[[8]], mechanism = "MNAR", 
+                           perc.missing = 0.2)$data.incomp
+
+
+result_wo_C <- SelvarClustLasso(
+  x = data_missing, 
+  nbcluster = 2:4,
+  rmodel = c("LB", "LI"), 
+  hsize = 2,
+  nbcores = detectCores(logical = TRUE),
+  impute_missing = TRUE,
+  scale_data = TRUE,
+  use_missing_pattern = FALSE
+)
+
+result_w_C <- SelvarClustLasso(
+  x = data_missing, 
+  nbcluster = 2:4,
+  rmodel = c("LB", "LI"), 
+  hsize = 2,
+  nbcores = detectCores(logical = TRUE),
+  impute_missing = TRUE,
+  scale_data = TRUE,
+  use_missing_pattern = TRUE
+)
+
+predicted_labels1 <- result_wo_C$partition
+# predicted_labels2 <- result_w_C$partition
+
+predicted_labels2<- apply(result_w_C$proba_corrected, 1, which.max)
+
+imputed_data1 <- result_wo_C$imputedData
+imputed_data2 <- result_w_C$imputedData
+
+
+
+similarity_metrics1 <- clustComp(cluster_assignments, predicted_labels1)
+similarity_metrics2 <- clustComp(cluster_assignments, predicted_labels2)
+
+# Compute Metrics for model wo C
+nrmse1 <- compute_nrmse(original_data = data, 
+                        missing_data = data_missing, 
+                        imputed_data = imputed_data1, 
+                        normalization = "missing")
+
+wnrmse1 <- compute_weighted_nrmse(original_data = data, 
+                       missing_data = data_missing, 
+                       imputed_data = imputed_data1, 
+                       true_labels = component,
+                       normalization = "missing")
+
+ciie1 <- compute_ciie(original_data = data, 
+                       missing_data = data_missing, 
+                       imputed_data = imputed_data1, 
+                       true_labels = component, 
+                       predicted_labels = predicted_labels1, 
+                       normalization = "missing", 
+                       alpha = 0.5, 
+                       beta = 0.5)
+
+# Compute Metrics for model w C
+nrmse2 <- compute_nrmse(original_data = data, 
+                        missing_data = data_missing, 
+                        imputed_data = imputed_data2, 
+                        normalization = "missing")
+
+wnrmse2 <- compute_weighted_nrmse(original_data = data, 
+                       missing_data = data_missing, 
+                       imputed_data = imputed_data2, 
+                       true_labels = component, 
+                       normalization = "missing")
+
+ciie2 <- compute_ciie(original_data = data, 
+                       missing_data = data_missing, 
+                       imputed_data = imputed_data2, 
+                       true_labels = component, 
+                       predicted_labels = predicted_labels2, 
+                       normalization = "missing", 
+                       alpha = 0.5, 
+                       beta = 0.5)
+
+metrics_summary <- data.frame(
+  Method = c("Model wo C", "Model w C"),
+  NRMSE = c(round(nrmse1, 4), round(nrmse2, 4)),
+  WNRMSE = c(round(wnrmse1, 4), round(wnrmse2, 4)),
+  ARI = c(round(similarity_metrics1$ARI, 4), round(similarity_metrics2$ARI, 4)),
+  CIIE = c(round(ciie1, 4), round(ciie2, 4))
+)
+
+print(metrics_summary)
+
+```
+
+```{r}
+x <- data_missing
+x <- as.matrix(x)
+n <- as.integer(nrow(x))
+p <- as.integer(ncol(x))
+n_iter <- 50
+
+C_orig <- matrix(as.numeric(is.na(x)), nrow = n, ncol = p)
+# tau_old <- result_wo_C$proba
+tau <- result_wo_C$proba
+S <- result_wo_C$S
+number_clusters <- result_wo_C$nbcluster
+m <- length(S)
+# For each cluster k and each variable in S, fit an intercept-only GLM (probit link)
+alpha_hat <- matrix(NA, nrow = number_clusters, ncol = length(S))
+      for (k in 1:number_clusters) {
+        for (s in seq_along(S)) {
+          j <- S[s]
+          fit <- glm(C_orig[, j] ~ 1, weights = tau_old[, k], family = binomial(link = "probit"))
+          alpha_hat[k, s] <- coef(fit)[1]
+        }
+      }
+# Compute likelihood contribution L_mat for each observation i and cluster k
+L_mat <- matrix(NA, nrow = n, ncol = number_clusters)
+      for (i in 1:n) {
+        for (k in 1:number_clusters) {
+          L_val <- 1
+          for (s in seq_along(S)) {
+            j <- S[s]
+            prob <- pnorm(alpha_hat[k, s])
+            if (is.na(x[i, j])) {
+              L_val <- L_val * prob
+            } else {
+              L_val <- L_val * (1 - prob)
+            }
+          }
+          L_mat[i, k] <- L_val
+        }
+      }
+
+# Update responsibilities
+# tau_new <- tau_old * L_mat
+# tau_new <- tau_new / rowSums(tau_new)
+# result_wo_C$proba_corrected <- tau_new
+# Update imputed values
+# Use conditional expectation
+x_corrected <- result_wo_C$imputedData
+
+for (iter in 1:n_iter) {
+  if (iter %% 10 == 0){
+  cat("Hybrid correction iteration", iter, "\n")}
+  # E-step: Estimate mechanism parameters for each cluster and variable in S.
+  for (k in 1:number_clusters) {
+    for (s in 1:m) {
+      j <- S[s]
+      fit <- suppressWarnings(glm(C_orig[, j] ~ 1, weights = tau[, k],
+                                  family = binomial(link = "probit")))
+      alpha_hat[k, s] <- coef(fit)[1]
+    }
+  }
+  
+  # Compute likelihood contributions L_mat for each observation and cluste
+  for (i in 1:n) {
+    for (k in 1:number_clusters) {
+      L_val <- 1
+      for (s in 1:m) {
+        j <- S[s]
+        prob <- pnorm(alpha_hat[k, s])
+        # If x[i, j] is missing, use prob; else use 1-prob.
+        if (is.na(x[i, j])) {
+          L_val <- L_val * prob
+        } else {
+          L_val <- L_val * (1 - prob)
+        }
+      }
+      L_mat[i, k] <- L_val
+    }
+  }
+  
+  # Update responsibilities
+  tau_new <- tau * L_mat
+  tau_new <- tau_new / rowSums(tau_new)
+  
+  # M-step: Update imputed values for missing entries.
+  for (i in 1:n) {
+    missing_idx <- which(is.na(x[i, S]))
+    if (length(missing_idx) > 0) {
+      for (s in missing_idx) {
+        impute_val <- 0
+        for (k in 1:number_clusters) {
+          # In your model, finalModel$parameters@mean is a matrix (number_clusters x m)
+          mu_k <- result_w_C$parameters@mean[k, ]
+          # For diagonal covariance, the conditional expectation is simply mu_k[s]
+          cond_exp <- mu_k[s]
+          impute_val <- impute_val + tau_new[i, k] * cond_exp
+        }
+        # Update the imputed value at the original column index S[s]
+        x_corrected[i, S[s]] <- impute_val
+      }
+    }
+  }
+  
+  # Update tau
+  tau <- tau_new
+}
+
+result_w_C$proba_corrected <- tau
+result_w_C$imputedData <- x_corrected
+
+
+```
+
+
+# Asymptotic Chi-squared
+Some key notes:
+
++ The empirical LRT statistics have heavier tails than expected under $\chi^2_{2}$
+
++ Extreme deviations occur in the upper tail, suggesting non-standard asymptotics 
+
+```{r}
+set.seed(123)
+n <- 2000  
+K <- 2     
+
+p <- c(0.5, 0.5)
+
+# Clustering (S) parameters: 3 variables
+mu1 <- c(0, 0, 0)
+mu2 <- c(3, -3, 1)
+mu_list <- list(mu1, mu2)
+Sigma1 <- diag(1, 3)
+Sigma2 <- diag(1, 3)
+Sigma_list <- list(Sigma1, Sigma2)
+
+# Regression (S^c) parameters: 2 variables
+a <- c(1, -1)            # intercept (length 2)
+Omega <- diag(c(1,1))    # error covariance (2x2)
+
+# Full model regression parameters R0 = {V1, V2}
+beta_full <- matrix(c(0.5, 1,
+                      0.2, -0.3), nrow = 2, byrow = TRUE)  # 2x2 matrix
+# Embed beta_full into a 3x2 matrix (nonzero rows for predictors V1,V2; zero for V3)
+tilde_beta_full <- rbind(beta_full, c(0, 0))   # dimension 3 x 2
+
+# Reduced model: restrict the effect of V2 to zero
+beta_reduced <- matrix(c(0.5, 1), nrow = 1)  # 1 x 2 matrix
+tilde_beta_reduced <- rbind(beta_reduced, matrix(0, nrow = 2, ncol = 2))  # 3 x 2
+
+# Simulate complete data from the full model
+# first 3 entries (S: V1-V3) and last 2 entries (S^c: V4-V5).
+
+data_mat <- matrix(NA, nrow = n, ncol = 5)
+true_component <- numeric(n)
+
+for(i in 1:n){
+  k <- sample(1:K, 1, prob = p)
+  true_component[i] <- k
+  
+  y_S <- mvrnorm(1, mu = mu_list[[k]], Sigma = Sigma_list[[k]])
+  
+  mean_reg <- as.vector(a + t(tilde_beta_full) %*% mu_list[[k]])
+  cov_reg <- Omega + t(tilde_beta_full) %*% Sigma_list[[k]] %*% tilde_beta_full
+  
+  y_reg <- mvrnorm(1, mu = mean_reg, Sigma = cov_reg)
+  
+  data_mat[i, ] <- c(y_S, y_reg)
+}
+colnames(data_mat) <- c("V1", "V2", "V3", "V4", "V5")
+
+# Compute the observed log–likelihood
+# For each observation, the likelihood is computed as a mixture:
+#   f(y_i^o) = sum_{k=1}^K pk * dmvnorm( y_S | muk, Sigmak ) *
+#                         dmvnorm( y_{S^c} | a + t(tilde_beta)*muk, Omega + t(tilde_beta)*Sigmak*tilde_beta)
+logLik_obs <- function(data, p, mu_list, Sigma_list, a, Omega, tilde_beta) {
+  n <- nrow(data)
+  loglik <- numeric(n)
+  
+  for(i in 1:n){
+    y_S   <- data[i, 1:3]  
+    y_reg <- data[i, 4:5]
+    
+    comp_density <- numeric(length(p))
+    for(k in 1:length(p)){
+      dens_S <- dmvnorm(y_S, mean = mu_list[[k]], sigma = Sigma_list[[k]])
+      
+      mean_reg <- as.vector(a + t(tilde_beta) %*% mu_list[[k]])
+      cov_reg <- Omega + t(tilde_beta) %*% Sigma_list[[k]] %*% tilde_beta
+      
+      dens_reg <- dmvnorm(y_reg, mean = mean_reg, sigma = cov_reg)
+      
+      comp_density[k] <- p[k] * dens_S * dens_reg
+    }
+    # Avoid log(0)
+    loglik[i] <- log(sum(comp_density) + 1e-12)
+  }
+  return(sum(loglik))
+}
+
+# Observed log–likelihood under the two models
+logL_full    <- logLik_obs(data_mat, p, mu_list, Sigma_list, a, Omega, tilde_beta_full)
+logL_reduced <- logLik_obs(data_mat, p, mu_list, Sigma_list, a, Omega, tilde_beta_reduced)
+
+LR_obs <- 2 * (logL_full - logL_reduced)
+cat("Observed LR statistic =", LR_obs, "\n")
+
+# Bootstrap the LR statistic under the null (reduced model)
+# We simulate new datasets from the reduced model (tilde_beta_reduced)
+# and then compute the LR statistic (comparing the full and reduced likelihoods) on each dataset.
+Bsim <- 200
+LR_boot <- numeric(Bsim)
+set.seed(456)
+for(b in 1:Bsim){
+  data_boot <- matrix(NA, nrow = n, ncol = 5)
+  for(i in 1:n){
+    k <- sample(1:K, 1, prob = p)
+    
+    # Clustering part remains the same:
+    y_S <- mvrnorm(1, mu = mu_list[[k]], Sigma = Sigma_list[[k]])
+    
+    # Regression part under the reduced model:
+    mean_reg <- as.vector(a + t(tilde_beta_reduced) %*% mu_list[[k]])
+    cov_reg <- Omega + t(tilde_beta_reduced) %*% Sigma_list[[k]] %*% tilde_beta_reduced
+    y_reg <- mvrnorm(1, mu = mean_reg, Sigma = cov_reg)
+    
+    data_boot[i, ] <- c(y_S, y_reg)
+  }
+  
+  ll_full_boot    <- logLik_obs(data_boot, p, mu_list, Sigma_list, a, Omega, tilde_beta_full)
+  ll_reduced_boot <- logLik_obs(data_boot, p, mu_list, Sigma_list, a, Omega, tilde_beta_reduced)
+  
+  LR_boot[b] <- 2 * (ll_full_boot - ll_reduced_boot)
+}
+
+# Compare the empirical distribution with the theoretical one
+# Under the null, the number of restrictions is the difference in the number of free parameters in β.
+# Here, full model: β_full is 2×2 (4 parameters), reduced model: only 1×2 (2 parameters).
+# So the degrees of freedom is 2.
+x_grid <- seq(0, max(c(LR_boot[LR_boot!=0], LR_obs, 10)), length.out = 500)
+ecdf_LR <- ecdf(LR_boot[LR_boot!=0])
+cdf_chisq <- pchisq(x_grid, df = 2)
+
+# Plot the empirical CDF and the chi-square CDF.
+plot(x_grid, ecdf_LR(x_grid), type = "l", lwd = 2, col = "blue",
+     xlab = "LR Statistic", ylab = "CDF", main = "ECDF of LR Statistic vs. Chi-square CDF")
+lines(x_grid, cdf_chisq, col = "red", lwd = 2, lty = 2)
+abline(v = LR_obs, col = "darkgreen", lwd = 2)
+legend("bottomright", legend = c("Empirical CDF", "Chi-square CDF (df=2)", 
+                                  paste("Observed LR =", round(LR_obs,2))),
+       col = c("blue", "red", "darkgreen"), lwd = 2, lty = c(1,2,1))
+
+cat("Mean simulated LR =", mean(LR_boot), "\n")
+cat("SD of simulated LR =", sd(LR_boot), "\n")
+
+
+
+ks.test(LR_boot[LR_boot!=0], "pchisq", 2)
 ```

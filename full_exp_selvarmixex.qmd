@@ -1,0 +1,3790 @@
+---
+title: "Full Experiment SelvarMixEx"
+author: "Ho Huu Binh"
+date: "`r Sys.Date()`"
+toc: true
+format:
+  html: 
+    toc: true
+    toc_float: true
+    code: true
+    code-fold: true
+    code-tools: true
+  pdf: 
+    fontsize: "12"
+    toc: true
+    number-sections: true
+    number-depth: 3
+---
+Progress:
+-7-3-2025:
+
+# Build package
+```{r}
+create_package_tarball <- function(path) {
+  Rcpp::compileAttributes(path)
+
+  pkg_name <- basename(path)
+
+  parent_dir <- dirname(path)
+
+  devtools::build(path, path = parent_dir, binary = FALSE)
+}
+tar_filename <- "D:/RProject/SelvarMix_1.2.1.tar.gz"
+if (!file.exists(tar_filename)) {
+  create_package_tarball("D:/Rproject/SelvarMix_extend")
+}
+install.packages("D:/RProject/SelvarMix_1.2.1.tar.gz", repos = NULL, type="source")
+```
+
+## Loading libraries
+```{r, warning=F, message=F}
+rm(list=ls())
+# Data wrangling
+library(reshape2)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+select <- dplyr::select
+
+library(here)
+library(Gmisc)
+library(glasso)
+library(mvtnorm)
+library(Matrix)
+library(stats)
+library(BMA)
+library(mlogitBMA)
+library(mlogit)
+library(foreach)
+library(parallel)
+library(doParallel)
+library(iterators)
+library(matrixStats)  
+library(aricode)
+source("amputation.R")
+
+# MixAll and SelvarMix
+library(SelvarMix)
+library(MixAll)
+library(missRanger)
+
+# Benchmarks
+library(vscc)
+library(VarSelLCM)
+library(RMixtComp)
+library(mixture)
+library(Rmixmod)
+library(clustvarsel)
+library(mvtnorm)
+library(mclust)
+library(MGMM)
+library(EMCluster)
+library(flexmix)
+library(mixtools)
+library(bgmm)
+library(gcimputeR)
+
+dmvnorm <- mvtnorm::dmvnorm
+library(MASS)
+library(data.table)
+library(tmvtnorm)  
+library(MomTrunc)    
+library(Stat2Data)    
+library(VIM)       
+library(CensMFM)  
+library(kpodclustr)  
+library(Amelia)       
+library(mice)       
+library(mi)         
+library(tictoc)
+
+source("utils_missingdata_exp.R")
+source("simulate_data.R")
+source("EM_Gaussian_withoutNA.R")
+source("EM_Gaussian.R")
+source("SEM_Gaussian.R")
+source("Functions_misspecification.R")
+source('Internal_Functions_Gaussian.R')
+source('Internal_Functions_All.R')
+source('initialization.R')
+source('utils_sportisse_exp.R')
+source('GPMMCM/Function/F-G.R')
+source('GPMMCM/Function/fn/EEE_GMIXCMB.R')
+source('GPMMCM/Function/fn/EEI_GMIXCMB.R')
+source('GPMMCM/Function/fn/EEV_GMIXCMB.R')
+source('GPMMCM/Function/fn/EII_GMIXCMB.R')
+source('GPMMCM/Function/fn/EVE_GMIXCMB.R')
+source('GPMMCM/Function/fn/EVI_GMIXCMB.R')
+source('GPMMCM/Function/fn/EVI_GMIXCMB.R')
+source('GPMMCM/Function/fn/EVV_GMIXCMB.R')
+source('GPMMCM/Function/fn/VEE_GMIXCMB.R')
+source('GPMMCM/Function/fn/VEI_GMIXCMB.R')
+source('GPMMCM/Function/fn/VEV_GMIXCMB.R')
+source('GPMMCM/Function/fn/VII_GMIXCMB.R')
+source('GPMMCM/Function/fn/VVE_GMIXCMB.R')
+source('GPMMCM/Function/fn/VVI_GMIXCMB.R')
+source('GPMMCM/Function/fn/VVV_GMIXCMB.R')
+
+# Improve model choice 
+source('ImprovingModelChoice/code/algorithms.R')
+source('listToS4.R')
+
+```
+
+## Sensitivity analysis
+```{r}
+# Set up parameters
+data_sen <- list(data, data_list[[8]])
+hsize_values  <- c(2, 3, 5, 7)
+data_sen_labels <- list(component, cluster_assignments) 
+true_S <- list(
+    "Dataset_1" = c("1", "2", "3"),
+    "Dataset_2" = c("1", "2"))
+
+# Missing rates per dataset
+missing_rates_list <- list(
+  c(0.01, 0.05, 0.1, 0.15, 0.2),  
+  c(0.2)                  
+)
+
+# Number of simulation runs
+n_runs <- 20  
+
+# Initialize the complete nested list structure
+# Structure: Dataset -> MissingRate -> HSize -> Run -> Result
+sensitivity_results <- vector("list", length(data_sen))
+names(sensitivity_results) <- paste0("Dataset_", seq_along(data_sen))
+
+for(i in seq_along(data_sen)) {
+  current_missing_rates <- missing_rates_list[[i]]
+  sensitivity_results[[i]] <- vector("list", length(current_missing_rates))
+  names(sensitivity_results[[i]]) <- paste0("MissingRate_", current_missing_rates)
+  
+  for(j in seq_along(current_missing_rates)) {
+    sensitivity_results[[i]][[j]] <- vector("list", length(hsize_values))
+    names(sensitivity_results[[i]][[j]]) <- paste0("h", hsize_values)
+    
+    for(k in seq_along(hsize_values)) {
+      sensitivity_results[[i]][[j]][[k]] <- vector("list", n_runs)
+      names(sensitivity_results[[i]][[j]][[k]]) <- paste0("Run_", 1:n_runs)
+    }
+  }
+}
+
+# Timing tracking
+timing_results <- data.frame(
+  Dataset = character(),
+  Missing_Rate = numeric(),
+  HSize = numeric(),
+  Run = numeric(),
+  Run_Time_Seconds = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Create results directory if it doesn't exist
+dir.create("sensitivity_results", showWarnings = FALSE)
+
+# Set cores
+nbcores_to_use <- min(6, parallel::detectCores(logical = TRUE) - 1)
+cat("Using", nbcores_to_use, "cores for computation\n")
+
+total_start_time <- Sys.time()
+
+# Start the simulation runs
+for (run_idx in 1:n_runs) {
+  cat("\n=== Starting Run", run_idx, "===\n")
+  
+  # Start track each run time 
+  run_start_time <- Sys.time()
+  
+  for (dat_idx in seq_along(data_sen)) {
+    current_data <- data_sen[[dat_idx]]
+    current_labels <- data_sen_labels[[dat_idx]]
+    num_vars <- ncol(current_data)
+    
+    cat("\nProcessing Dataset", dat_idx, "with", num_vars, "variables.\n")
+    
+    current_missing_rates <- missing_rates_list[[dat_idx]]
+    
+    for (miss_idx in seq_along(current_missing_rates)) {
+      miss_rate <- current_missing_rates[miss_idx]
+      cat("\n  Missing Rate:", miss_rate, "\n")
+      
+      for (h_idx in seq_along(hsize_values)) {
+        h <- hsize_values[h_idx]
+        cat("    Processing hsize:", h, "\n")
+        
+        # Start track config time 
+        config_start_time <- Sys.time()
+        
+        # Check if the result for this run already exists to allow resuming
+        result_file <- file.path("sensitivity_results", paste0("dataset_", dat_idx, "_miss_", miss_rate, "_h_", h, "_run_", run_idx, "_results.rds"))
+        if (file.exists(result_file)) {
+          cat("    Loading existing results for run", run_idx, "\n")
+          sensitivity_results[[dat_idx]][[miss_idx]][[h_idx]][[run_idx]] <- readRDS(result_file)
+          next
+        }
+        
+        tryCatch({
+          # Generate missing data
+          data_missing <- produce_NA(current_data, 
+                                     mechanism = "MAR", 
+                                     perc.missing = miss_rate)$data.incomp
+          
+          # Run SelvarClustLasso
+          selvar_result <- SelvarClustLasso(
+            x = data_missing, 
+            nbcluster = 2:4,
+            rmodel = c("LB", "LI"), 
+            hsize = h, 
+            nbcores = nbcores_to_use,
+            impute_missing = TRUE,
+            scale_data = TRUE
+          )
+          
+          config_time <- as.numeric(difftime(Sys.time(), 
+                                             config_start_time, 
+                                             units = "secs"))
+          
+          # Store timing results
+          timing_results <- rbind(timing_results, data.frame(
+            Dataset = paste0("Dataset_", dat_idx),
+            Missing_Rate = miss_rate,
+            HSize = h,
+            Run = run_idx,
+            Run_Time_Seconds = config_time,
+            stringsAsFactors = FALSE
+          ))
+          
+          # Extract results and compute metrics
+          imputed_data_selvar <- selvar_result$imputedData
+          predicted_labels_selvar <- selvar_result$partition
+          
+          # Compute all metrics with individual error handling
+          ari_selvar <- tryCatch({
+            adjustedRandIndex(current_labels, predicted_labels_selvar)
+          }, error = function(e) {
+            cat("    Warning: Failed to compute ARI:", conditionMessage(e), "\n")
+            return(NA)
+          })
+          
+          nrmse_selvar <- tryCatch({
+            compute_nrmse(
+              original_data = current_data, 
+              missing_data = data_missing, 
+              imputed_data = imputed_data_selvar, 
+              normalization = "missing"
+            )
+          }, error = function(e) {
+            cat("    Warning: Failed to compute NRMSE:", conditionMessage(e), "\n")
+            return(NA)
+          })
+          
+          wnrmse_selvar <- tryCatch({
+            compute_weighted_nrmse(
+              original_data = current_data, 
+              missing_data = data_missing, 
+              imputed_data = imputed_data_selvar, 
+              true_labels = current_labels,
+              normalization = "missing"
+            )
+          }, error = function(e) {
+            cat("    Warning: Failed to compute WNRMSE:", conditionMessage(e), "\n")
+            return(NA)
+          })
+          
+          ciie_selvar <- tryCatch({
+            compute_ciie(
+              original_data = current_data, 
+              missing_data = data_missing, 
+              imputed_data = imputed_data_selvar, 
+              true_labels = current_labels, 
+              predicted_labels = predicted_labels_selvar, 
+              normalization = "missing", 
+              alpha = 0.5, 
+              beta = 0.5
+            )
+          }, error = function(e) {
+            cat("    Warning: Failed to compute CIIE:", conditionMessage(e), "\n")
+            return(NA)
+          })
+          
+          # Create results dataframe
+          result <- data.frame(
+            Run = run_idx,
+            Dataset = paste0("Dataset_", dat_idx),
+            Num_Variables = num_vars,
+            Missing_Rate = miss_rate,
+            HSize = h,
+            Method = "SelvarClustLasso",
+            NRMSE = round(nrmse_selvar, 4),
+            WNRMSE = round(wnrmse_selvar, 4),
+            CIIE = round(ciie_selvar, 4),
+            BIC = selvar_result$criterionValue,
+            Num_Clusters = selvar_result$nbcluster,  
+            Relevant_Variables = paste(selvar_result$S, collapse = ", "),
+            ARI = round(ari_selvar, 4),
+            stringsAsFactors = FALSE
+          )
+          
+          result$Run_Time_Seconds <- config_time
+          
+          # Store result
+          sensitivity_results[[dat_idx]][[miss_idx]][[h_idx]][[run_idx]] <- result
+          
+          # Save intermediate results for this run
+          saveRDS(sensitivity_results[[dat_idx]][[miss_idx]][[h_idx]][[run_idx]], result_file)
+          cat("    Saved results for run", run_idx, "\n")
+          print(result)
+          cat("    Completed in", round(config_time, 2), "seconds\n")
+          
+          # Cleanup
+          gc()
+          
+        }, error = function(e) {
+          cat("\n    Error occurred for hsize =", h, "in run", run_idx, ":\n")
+          cat("    Error message:", conditionMessage(e), "\n")
+        })
+      }
+    }
+  }
+  
+  run_time <- as.numeric(difftime(Sys.time(), run_start_time, units = "secs"))
+  cat("=== Completed Run", run_idx, "in", round(run_time, 2), "seconds ===\n")
+}
+
+total_time <- as.numeric(difftime(Sys.time(), total_start_time, units = "secs"))
+
+# Function to transform and compute aggregated metrics
+transform_sensitivity_results <- function(sensitivity_results, 
+                                          timing_results,
+                                          n_runs, 
+                                          true_num_cluster = 4,
+                                          true_relevant_vars = true_S) {
+  # Initialize an empty list to store all results
+  all_results <- list()
+  
+  # Loop through each dataset
+  for(dat_idx in seq_along(sensitivity_results)) {
+    dataset_results <- sensitivity_results[[dat_idx]]
+    
+    # Loop through each missing rate
+    for(miss_idx in seq_along(dataset_results)) {
+      missing_rate_results <- dataset_results[[miss_idx]]
+      
+      # Loop through each h-size
+      for(h_idx in seq_along(missing_rate_results)) {
+        h_results <- missing_rate_results[[h_idx]]
+        
+        # Loop through each run
+        for(run_idx in seq_along(h_results)) {
+          result <- h_results[[run_idx]]
+          
+          # Only add non-null results
+          if(!is.null(result)) {
+            all_results[[length(all_results) + 1]] <- result
+          }
+        }
+      }
+    }
+  }
+  
+  # Combine into a single tibble
+  results_tibble <- bind_rows(all_results)|>
+    mutate(across(c(Dataset, Method, Relevant_Variables), as.factor))|>
+    mutate(across(c(Num_Variables, Missing_Rate, HSize, 
+                   NRMSE, WNRMSE, CIIE, BIC, 
+                   Num_Clusters, ARI), as.numeric))
+  
+  results_tibble <- results_tibble |>
+    mutate(
+      Correct_Variables = map2_int(Dataset, Relevant_Variables, ~ {
+        true_vars <- true_relevant_vars[[.x]]
+        selected_vars <- str_split(.y, ",\\s*")[[1]]
+        if(length(selected_vars) != length(true_vars)) {
+          return(0)
+        } else {
+          return(all(sort(selected_vars) == sort(true_vars)) * 1)
+        }
+      })
+    )
+  
+  # Compute metric summaries
+  freq_cluster <- results_tibble |>
+    mutate(Correct_Clusters = ifelse(Num_Clusters == true_num_cluster, 1, 0)) |>
+    group_by(Dataset, Missing_Rate, HSize, Method) |>
+    summarise(
+      Avg_NRMSE = mean(NRMSE, na.rm = TRUE),
+      SD_NRMSE = sd(NRMSE, na.rm = TRUE),
+      
+      Avg_WNRMSE = mean(WNRMSE, na.rm = TRUE),
+      SD_WNRMSE = sd(WNRMSE, na.rm = TRUE),
+      
+      Avg_CIIE = mean(CIIE, na.rm = TRUE),
+      SD_CIIE = sd(CIIE, na.rm = TRUE),
+      
+      Avg_BIC = mean(BIC, na.rm = TRUE),
+      SD_BIC = sd(BIC, na.rm = TRUE),
+      
+      Avg_ARI = mean(ARI, na.rm = TRUE),
+      SD_ARI = sd(ARI, na.rm = TRUE),
+      
+      freq_num_cluster = sum(Correct_Clusters, na.rm = TRUE),
+      
+      freq_correct_variables = sum(Correct_Variables, na.rm = TRUE),
+      
+      .groups = 'drop'
+    ) |>
+    arrange(Dataset, Missing_Rate, HSize)
+  
+  # Compute timing summaries
+  timing_summary <- timing_results |>
+    group_by(Dataset, Missing_Rate, HSize) |>
+    summarise(
+      Avg_Run_Time = mean(Run_Time_Seconds, na.rm = TRUE),
+      SD_Run_Time = sd(Run_Time_Seconds, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  freq_cluster <- freq_cluster |> 
+    left_join(timing_summary, by = c("Dataset", "Missing_Rate", "HSize"))
+  
+  return(freq_cluster)
+}
+
+# Transform and aggregate the results
+results_tibble <- transform_sensitivity_results(sensitivity_results, 
+                                                timing_results,
+                                                n_runs)
+
+# Save results
+final_results_file <- file.path("sensitivity_results", "averaged_sensitivity_results.rds")
+saveRDS(results_tibble, final_results_file)
+cat("\nAnalysis complete. Averaged results saved to:", final_results_file, "\n")
+cat("\nTotal execution time:", round(total_time/3600, 2), "hours\n")
+cat("Average time per run:", round(total_time/n_runs/60, 2), "minutes\n\n")
+
+# df <- readRDS(here("MissingData_MOE\\sensitivity_results\\averaged_sensitivity_results.rds"))
+
+```
+
+
+## Full analysis Maugis
+```{r}
+set.seed(123)
+
+data_maugis_2012 <- simulate_Maugis_data2012()
+data_maugis_2019 <- simulate_Maugis_data2019(scenario = 8)
+
+# Configuration -----------------------------------------------------------
+data_sen <- list(data_maugis_2012$data, data_maugis_2019$data)
+data_sen_labels <- list(data_maugis_2012$class, data_maugis_2019$class)
+true_S <- list(Dataset_1 = c("1", "2", "3"), Dataset_2 = c("1", "2"))
+true_num_clusters <- list(Dataset_1 = 4, Dataset_2 = 4)
+hsize_per_dataset <- c(2, 2)
+
+## For experiment only 
+# data_sen <- list(data_maugis_2019$data)
+# data_sen_labels <- list(data_maugis_2019$class) 
+# true_S <- list(Dataset_2 = c("1", "2"))
+# true_num_clusters <- list(Dataset_2 = 4)
+# hsize_per_dataset <- c(2)
+
+missing_rates <- c(0.1)
+missing_patterns <- c("MNAR")
+n_runs <- 10
+# models <- c("Selvar", "SelvarMNARz", "Clustvarsel")
+models <- c("Selvar", "SelvarMNARz")
+
+# Core setup --------------------------------------------------------------
+total_cores <- detectCores()
+available_cores <- max(1, total_cores - 2)
+cl <- makeCluster(available_cores)
+registerDoParallel(cl)
+
+# Create results directory in main process and workers
+base_dir <- getwd()
+results_dir <- file.path(base_dir, "sensitivity_results")
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+clusterExport(cl, c("base_dir", "results_dir"))
+
+
+# Create parameter grid for all combinations
+task_grid <- expand.grid(
+  run_idx = 1:n_runs,
+  dat_idx = seq_along(data_sen),
+  miss_rate = missing_rates,
+  miss_pattern = missing_patterns,
+  model = models
+)
+
+# Filter out combinations where missing rate is 0 but pattern varies
+task_grid <- task_grid %>%
+  filter(!(miss_rate == 0 & miss_pattern == "MNAR"))
+
+
+# Main parallel computation -----------------------------------------------
+results <- foreach(task = 1:nrow(task_grid), .combine = rbind,
+                   .packages = c("dplyr", "stringr", "missRanger", 
+                                "clustvarsel", "SelvarMix", "aricode",
+                                "mclust")) %dopar% {
+  
+  # Extract parameters from task grid
+  run_idx <- task_grid$run_idx[task]
+  dat_idx <- task_grid$dat_idx[task]
+  miss_rate <- task_grid$miss_rate[task]
+  miss_pattern <- as.character(task_grid$miss_pattern[task])
+  model_name <- as.character(task_grid$model[task])
+  
+  # Dataset-specific parameters
+  current_data <- data_sen[[dat_idx]]
+  current_labels <- data_sen_labels[[dat_idx]]
+  fixed_hsize <- hsize_per_dataset[dat_idx]
+  dataset_name <- paste0("Dataset_", dat_idx)
+  result_file <- file.path(results_dir, 
+                           sprintf("dataset_%d_miss_%s_pattern_%s_model_%s_run_%d.rds",
+            dat_idx, miss_rate, miss_pattern, model_name, run_idx))
+  
+  # Skip existing results
+  if (file.exists(result_file)) return(NULL)
+  
+  tryCatch({
+    data_missing <- if (miss_rate == 0) {
+      current_data
+    } else {
+      produce_NA(current_data, mechanism = miss_pattern, 
+                perc.missing = miss_rate)$data.incomp
+    }
+    
+    # Model execution
+    start_time <- Sys.time()
+    
+    if (model_name == "Selvar") {
+      model_result <- SelvarClustLasso(
+        x = data_missing,
+        nbcluster = 2:4,
+        # models="mixmodGaussianModel(family=\"all\")",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = fixed_hsize,
+        nbcores = 1,
+        impute_missing = (miss_rate > 0),
+        scale_data = TRUE,
+        use_missing_pattern = FALSE
+      )
+      imputed_data <- model_result$imputedData
+      predicted_labels <- model_result$partition
+      relevant_vars <- paste(model_result$S, collapse = ", ")
+      bic <- model_result$criterionValue
+      n_clusters <- model_result$nbcluster
+      
+    } else if (model_name=="SelvarMNARz") {
+        model_result <- SelvarClustLasso(
+        x = data_missing,
+        nbcluster = 2:4,
+        # models="mixmodGaussianModel(family=\"all\")",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = fixed_hsize,
+        nbcores = 1,
+        impute_missing = (miss_rate > 0),
+        scale_data = TRUE,
+        use_missing_pattern = TRUE,
+        true_labels = current_labels
+      )
+      imputed_data <- model_result$imputedData
+      predicted_labels <- model_result$partition
+      relevant_vars <- paste(model_result$S, collapse = ", ")
+      bic <- model_result$criterionValue
+      n_clusters <- model_result$nbcluster
+    }
+    
+    else if (model_name == "Clustvarsel") {
+      data_imputed <- if (miss_rate == 0) data_missing else missRanger(data_missing)
+      
+      model_result <- clustvarsel(
+        data_imputed,
+        G = 2:4,
+        search = "greedy",
+        direction = "backward",
+        emModels1 = "V",
+        emModels2 = "VVI",
+        allow.EEE = FALSE,
+        forcetwo = FALSE,
+        parallel = FALSE  
+      )
+      
+      imputed_data <- data_imputed
+      predicted_labels <- model_result$model$classification
+      relevant_vars <- paste(model_result$subset, collapse = ", ")
+      bic <- model_result$model$bic
+      n_clusters <- model_result$model$G
+    }
+    
+    # Calculate metrics
+    compute_metric <- function(f) {
+      tryCatch(f(), error = function(e) NA)
+    }
+    
+    ari <- compute_metric(function() adjustedRandIndex(current_labels, predicted_labels))
+    nrmse <- compute_metric(function() compute_nrmse(current_data, imputed_data, data_missing))
+    w_nrmse <- compute_metric(function() compute_weighted_nrmse(current_data, data_missing, imputed_data, current_labels))
+    ciie <- compute_metric(function() compute_ciie(current_data, data_missing, imputed_data, current_labels, predicted_labels))
+    
+    # Create result object
+    result <- data.frame(
+      Run = run_idx,
+      Dataset = dataset_name,
+      Missing_Rate = miss_rate,
+      Missing_Pattern = miss_pattern, 
+      Model = model_name,
+      HSize = fixed_hsize,
+      Num_Variables = ncol(current_data),
+      NRMSE = round(nrmse, 4),
+      WNRMSE = round(w_nrmse, 4),
+      CIIE = round(ciie, 4),
+      BIC = round(bic, 2),
+      Num_Clusters = n_clusters,
+      Relevant_Variables = relevant_vars,
+      ARI = round(ari, 4),
+      Run_Time_Seconds = round(difftime(Sys.time(), start_time, units = "secs"), 2),
+      stringsAsFactors = FALSE
+    )
+    
+    # Save individual result
+    saveRDS(result, result_file)
+    result
+    
+  }, error = function(e) {
+    message(sprintf("Error in task %d: %s", task, conditionMessage(e)))
+    NULL
+  })
+}
+
+# Cleanup parallel workers
+stopCluster(cl)
+
+# Post-processing ---------------------------------------------------------
+result_files <- list.files("sensitivity_results", pattern = "\\.rds$", full.names = TRUE)
+if(length(result_files) == 0) {
+  warning("No result files were generated. Check cluster logs for errors.")
+  all_results <- data.frame()
+} else {
+  all_results <- lapply(result_files, readRDS) |> bind_rows()
+}
+
+saveRDS(all_results, file = "sensitivity_results/exp_10_MNAR_Maugis_detailed.rds")
+write.csv(all_results, file = "sensitivity_results/exp_10_MNAR_Maugis_detailed.csv", row.names = FALSE)
+```
+
+### Reading result
+```{r}
+# results <- read.csv("sensitivity_results/exp_10_MNAR_Maugis_detailed.csv")
+results <- all_results
+results <- results %>%
+  mutate(
+    correct_variables = case_when(
+      Dataset == "Dataset_1" ~ "1, 2, 3",
+      Dataset == "Dataset_2" ~ "1, 2",
+      TRUE ~ NA_character_
+    )
+  )
+
+summary_results <- results %>%
+  group_by(Dataset, Model, Missing_Rate) %>%
+  summarize(
+    mean_ARI = mean(ARI, na.rm = TRUE),
+    mean_WNRMSE = mean(WNRMSE, na.rm = TRUE),
+    prop_correct_clusters = mean(Num_Clusters == 4, na.rm = TRUE),
+    prop_correct_variables = mean(Relevant_Variables == correct_variables[1], na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+summary_results
+
+metrics <- c("ARI", "WNRMSE")
+model_var <- "Model"
+missing_rate_var <- "Missing_Rate"
+pattern_var <- "Missing_Pattern"
+prop_vars <- c("prop_correct_clusters", "prop_correct_variables")
+dataset_var <- "Dataset"
+
+long_results <- results %>%
+    pivot_longer(
+      cols = all_of(metrics),
+      names_to = "Metric",
+      values_to = "Value"
+    )
+
+long_props <- summary_results %>%
+    pivot_longer(
+      cols = all_of(prop_vars),
+      names_to = "Proportion_Type",
+      values_to = "Value"
+    ) %>%
+    mutate(
+      Proportion_Type = case_when(
+        Proportion_Type == "prop_correct_clusters" ~ "Correct Number of Clusters",
+        Proportion_Type == "prop_correct_variables" ~ "Correct Relevant Variables",
+        TRUE ~ Proportion_Type
+      )
+    )
+  
+  
+model_colors <- viridisLite::viridis(length(unique(long_results$Model)))
+
+p1 <- ggplot(long_results, aes(x = !!sym(model_var), y = Value, fill = !!sym(model_var))) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_manual(values = model_colors) +
+  geom_hline(data = filter(long_results, Metric == "ARI"), 
+             aes(yintercept = 0.9), 
+             linetype = "dashed", 
+             color = "red",
+             size = 0.75) +
+  facet_grid(
+    rows = vars(!!sym(missing_rate_var)),
+    cols = vars(!!sym(dataset_var))
+  ) +
+  labs(x = model_var, y = "ARI", fill = "Mechanism") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title = element_text(face = "bold"),
+          strip.background = element_rect(fill = "gray95"),
+          strip.text = element_text(face = "bold", color = "black"),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(color = "black", fill = NA),
+          legend.position = "right",
+          plot.title = element_text(hjust = 0.5))
+
+p2 <- ggplot(long_results, aes(x = !!sym(model_var), y = Value, fill = !!sym(model_var))) +
+  geom_boxplot(outlier.size = 1, alpha = 0.8) +
+  scale_fill_manual(values = model_colors) +
+  # geom_hline(data = filter(long_results, Metric == "WNRMSE"), 
+  #            aes(yintercept = 0.1), 
+  #            linetype = "dashed", 
+  #            color = "red",
+  #            size = 0.75) +
+  facet_grid(
+    rows = vars(!!sym(missing_rate_var)),
+    cols = vars(!!sym(dataset_var))
+  ) +
+  labs(x = model_var, y = "WNRMSE", fill = "Mechanism") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title = element_text(face = "bold"),
+          strip.background = element_rect(fill = "gray95"),
+          strip.text = element_text(face = "bold", color = "black"),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(color = "black", fill = NA),
+          legend.position = "right",
+          plot.title = element_text(hjust = 0.5))
+
+p3 <- ggplot(long_props, aes(x = !!sym(model_var), y = Value, 
+                            fill = !!sym(model_var))) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  scale_fill_manual(values = model_colors) +
+  facet_grid(
+    rows = vars(!!sym(missing_rate_var)),
+    cols = vars(!!sym(dataset_var), Proportion_Type)
+  ) +
+  labs(
+    x = "Model",
+    y = "Proportion",
+    fill = "Model",
+    title = "Proportion of Correct Selections by Model, Dataset, and Missing Rate"
+  ) +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title = element_text(face = "bold"),
+          strip.background = element_rect(fill = "gray95"),
+          strip.text = element_text(face = "bold", color = "black"),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(color = "black", fill = NA),
+          legend.position = "right",
+          plot.title = element_text(hjust = 0.5))
+
+```
+
+
+## Full analysis Sportisse 
+```{r, warning=F, message=F}
+# Experimental settings
+n <- 100
+K <- 3
+pik <- c(0.5, 0.25, 0.25) 
+
+d <- 6    # number of variables (can be 6, 9, or 3)
+missing_pattern <- "MNARz"
+tau <- 2.31
+
+# Define delta: interaction signals for each cluster & variable
+delta <- matrix(0, nrow = K, ncol = d)
+delta[1, 1] <- tau 
+delta[2, 2] <- tau
+delta[3, 3] <- tau
+delta[1, 4] <- tau
+delta[2, 5] <- tau
+delta[3, 6] <- tau
+
+# Missing mechanism parameters
+probmiss_z <- matrix(0, nrow = K, ncol = d, byrow = TRUE)
+probmiss_y <- rep(c(1.45, 0.2, -3), 2)
+intercept_y <- -1.38
+
+rmax_EM <- 60
+stop_EM <- "classical"
+tol_EM <- 0.001
+diag <- TRUE
+
+rmax <- 60
+rmax_MNARyzj <- 30
+rmax_MNARykzj <- 5
+init <- NULL
+stop <- "loglikmax"
+samplesize <- NULL
+
+Nbit_run <- 3
+nb_it <- 20
+
+# Performance metrics
+ARI_selvar <- numeric(nb_it)
+ARI_selvarMNARz <- numeric(nb_it)
+ARI_MCAR <- numeric(nb_it)
+ARI_MNARz <- numeric(nb_it)
+ARI_MNAR_true <- numeric(nb_it)
+ARI_Mean <- numeric(nb_it)
+ARI_Mice <- numeric(nb_it)
+ARI_missRanger <- numeric(nb_it)
+
+degen_selvar <- numeric(nb_it)
+degen_selvarMNARz <- numeric(nb_it)
+degen_MCAR <- numeric(nb_it)
+degen_MNARz <- numeric(nb_it)
+degen_MNAR_true <- numeric(nb_it)
+degen_Mean <- numeric(nb_it)
+degen_Mice <- numeric(nb_it)
+degen_missRanger <- numeric(nb_it)
+
+# Time tracking variables
+time_MNARz <- numeric(nb_it)
+time_selvar <- numeric(nb_it)
+time_selvarMNARz <- numeric(nb_it)
+time_Mean <- numeric(nb_it)
+time_Mice <- numeric(nb_it)
+time_missRanger <- numeric(nb_it)
+time_MCAR <- numeric(nb_it)
+
+# NRMSE tracking variables
+nrmse_MNARz <- numeric(nb_it)
+nrmse_selvarMNARz <- numeric(nb_it)
+nrmse_Mean <- numeric(nb_it)
+nrmse_Mice <- numeric(nb_it)
+nrmse_missRanger <- numeric(nb_it)
+nrmse_selvar <- numeric(nb_it)
+
+# Total execution time
+total_time_start <- proc.time()
+
+for (it in 1:nb_it) {
+  cat("ITERATION GENERALE:", it, "\n")
+  set.seed(it)
+  
+  # --- Simulate True Cluster Membership and Data ---
+  Z <- SimuZ(n = n, pik = pik)
+  Partition_true <- apply(Z, 1, function(z) which(z == 1))
+  
+  Y <- matrix(NA, nrow = n, ncol = d)
+  for (j in 1:d) {
+    Y[, j] <- Z %*% delta[, j] + rnorm(n)
+  }
+  
+  # Introduce missing data using simulated mechanism (here "MNARy")
+  # Option: MNARz, MNARy, MNARyz
+  C <- SimuC(pik, Y, Z, "MNARy", probmiss_z = probmiss_z, 
+             probmiss_y = probmiss_y, intercept_y = intercept_y)
+  YNA <- Y
+  YNA[C] <- NA
+  
+  # For selvar since it imputes original data
+  missing_vals <- copy(YNA)
+  # Ensure no observation is completely missing
+  indexallNA <- c()
+  for (i in 1:n) {
+    if (sum(is.na(YNA[i, ])) == d) {
+      indexallNA <- c(indexallNA, i)
+      num <- sample(1:d, 1)
+      YNA[i, num] <- Y[i, num]
+    }
+  }
+  
+  ### EM MCAR
+  cat("MCAR\n")
+  time_MCAR_start <- proc.time()
+  run_MCAR <- list()
+  it_MCAR <- 1
+  while (it_MCAR <= Nbit_run & degen_MCAR[it] < 10) {
+    res_MCAR <- EM_Gaussian(YNA = YNA, K = K, mecha = "MCAR", diag = diag, 
+                             rmax = rmax_EM, init = NULL, stop = stop_EM, tol = tol_EM)
+    if (typeof(res_MCAR) == "character") {
+      degen_MCAR[it] <- degen_MCAR[it] + 1
+    } else {
+      run_MCAR[[it_MCAR]] <- res_MCAR
+      it_MCAR <- it_MCAR + 1
+    }
+    cat("MCAR run:", it_MCAR, "\n")
+  }
+  time_MCAR_end <- proc.time()
+  time_MCAR[it] <- (time_MCAR_end - time_MCAR_start)["elapsed"]
+  
+  if (typeof(res_MCAR) == "character") {
+    ARI_MCAR[it] <- NA
+    nrmse_MCAR[it] <- NA
+  } else {
+    crit_MCAR <- lapply(run_MCAR, Critere_Gaussian, YNA = YNA, Partition_true = Partition_true, mecha = "MCAR")
+    whmax_MCAR <- which.max(sapply(crit_MCAR, function(x) x$ICL))
+    ARI_MCAR[it] <- crit_MCAR[[whmax_MCAR]]$ARI
+    
+    # Calculate NRMSE for MCAR
+    best_run <- run_MCAR[[whmax_MCAR]]
+    Y_imputed_MCAR <- best_run$imputedData
+    nrmse_MCAR[it] <- compute_nrmse(original_data = Y, 
+                                     missing_data = YNA, 
+                                     imputed_data = Y_imputed_MCAR,
+                                     normalization = "missing")
+  }
+  
+  #### EM MNARz
+  cat("MNARz\n")
+  time_MNARz_start <- proc.time()
+  run_MNARz <- list()
+  it_MNARz <- 1
+  while (it_MNARz <= Nbit_run & degen_MNARz[it] < 10) {
+    res_MNARz <- EM_Gaussian(YNA = YNA, K = K, mecha = "MNARz", diag = diag, 
+                             rmax = rmax_EM, init = NULL, stop = stop_EM, tol = tol_EM)
+    if (typeof(res_MNARz) == "character") {
+      degen_MNARz[it] <- degen_MNARz[it] + 1
+    } else {
+      run_MNARz[[it_MNARz]] <- res_MNARz
+      it_MNARz <- it_MNARz + 1
+    }
+    cat("MNARz run:", it_MNARz, "\n")
+  }
+  time_MNARz_end <- proc.time()
+  time_MNARz[it] <- (time_MNARz_end - time_MNARz_start)["elapsed"]
+  
+  if (typeof(res_MNARz) == "character") {
+    ARI_MNARz[it] <- NA
+    nrmse_MNARz[it] <- NA
+  } else {
+    crit_MNARz <- lapply(run_MNARz, Critere_Gaussian, YNA = YNA, Partition_true = Partition_true, mecha = "MNARz")
+    whmax_MNARz <- which.max(sapply(crit_MNARz, function(x) x$ICL))
+    ARI_MNARz[it] <- crit_MNARz[[whmax_MNARz]]$ARI
+    
+    # Calculate NRMSE for MNARz
+    best_run <- run_MNARz[[whmax_MNARz]]
+    Y_imputed_MNARz <- best_run$imputedData
+    nrmse_MNARz[it] <- compute_nrmse(original_data = Y, 
+                                     missing_data = YNA, 
+                                     imputed_data = Y_imputed_MNARz,
+                                     normalization = "missing")
+  }
+  
+  #### SelvarClustLasso MNARz
+  cat("SelvarClustLasso MNARz\n")
+  time_selvarMNARz_start <- proc.time()
+  run_selvarMNARz <- list()
+  it_selvarMNARz <- 1
+  while (it_selvarMNARz <= Nbit_run & degen_selvarMNARz[it] < 10) {
+    res_selvarMNARz <- SelvarClustLasso(
+    x = YNA,
+    nbcluster = 3,
+    models="mixmodGaussianModel(family=\"all\")",
+    rmodel = c("LB", "LI", "LC"),
+    hsize = 2,
+    nbcores = min(4, detectCores()),
+    impute_missing = TRUE,
+    scale_data = TRUE,
+    use_missing_pattern = TRUE
+  )
+    if (typeof(res_selvarMNARz) == "character") {
+      degen_selvarMNARz[it] <- degen_selvarMNARz[it] + 1
+    } else {
+      res_selvarMNARz_clean <- list(pik=res_selvarMNARz$parametersMNARz$parameters$pik, 
+                              mu=res_selvarMNARz$parametersMNARz$parameters$mu, 
+                              sigma=res_selvarMNARz$parametersMNARz$parameters$sigma,
+                              alpha=res_selvarMNARz$parametersMNARz$parameters$alpha, 
+                              beta=matrix(0,nrow=K,ncol=d))
+      run_selvarMNARz[[it_selvarMNARz]] <- res_selvarMNARz_clean
+      it_selvarMNARz <- it_selvarMNARz + 1
+      
+      # Store the imputed data for NRMSE calculation
+      if (it_selvarMNARz == 2) {
+        Y_imputed_selvarMNARz <- res_selvarMNARz$imputedData
+      }
+    }
+    cat("SelvarClustLasso MNARz run:", it_selvarMNARz, "\n")
+  }
+  time_selvarMNARz_end <- proc.time()
+  time_selvarMNARz[it] <- (time_selvarMNARz_end - time_selvarMNARz_start)["elapsed"]
+  
+  if (typeof(res_selvarMNARz) == "character") {
+    ARI_selvarMNARz[it] <- NA
+    nrmse_selvarMNARz[it] <- NA
+  } else {
+    crit_selvarMNARz <- lapply(run_selvarMNARz, Critere_Gaussian, 
+                         YNA = YNA, Partition_true = Partition_true, 
+                         mecha = "MNARz")
+    whmax_selvarMNARz <- which.max(sapply(crit_selvarMNARz, function(x) x$ICL))
+    ARI_selvarMNARz[it] <- crit_selvarMNARz[[whmax_selvarMNARz]]$ARI
+    
+    # Calculate NRMSE for SelvarClustLasso
+    nrmse_selvarMNARz[it] <- compute_nrmse(original_data = Y, 
+                                          imputed_data = Y_imputed_selvarMNARz,
+                                          missing_data = YNA, 
+                                          normalization = "missing")
+  }
+  
+  #### Mean Imputation
+  cat("Mean Imputation\n")
+  time_Mean_start <- proc.time()
+  
+  Y_mean_imp <- YNA
+  col_means <- colMeans(YNA, na.rm = TRUE)
+  
+  # Apply mean imputation
+  for (j in 1:d) {
+    missing_idx <- which(is.na(Y_mean_imp[, j]))
+    Y_mean_imp[missing_idx, j] <- col_means[j]
+  }
+  
+  # Run EM algorithm on mean-imputed data
+  run_mean <- "error"
+  it_mean <- 1
+  while (it_mean <= Nbit_run & degen_Mean[it] < 15) {
+    run_mean <- EM_Gaussian_withoutNA(Y = Y_mean_imp, K = K, diag = diag, 
+                                     rmax = rmax_EM, init = NULL, 
+                                     stop = stop_EM, tol = tol_EM)
+    if (typeof(run_mean) == "character") {
+      degen_Mean[it] <- degen_Mean[it] + 1
+    } else {
+      break
+    }
+    it_mean <- it_mean + 1
+    cat("Mean imputation run:", it_mean, "\n")
+  }
+  time_Mean_end <- proc.time()
+  time_Mean[it] <- (time_Mean_end - time_Mean_start)["elapsed"]
+  
+  if (typeof(run_mean) == "character") {
+    ARI_Mean[it] <- NA
+    nrmse_Mean[it] <- NA
+  } else {
+    crit_mean <- Critere_Gaussian_withoutNA(run_mean, Y_mean_imp, Partition_true)
+    ARI_Mean[it] <- crit_mean$ARI
+    
+    # Calculate NRMSE for mean imputation
+    nrmse_Mean[it] <- compute_nrmse(original_data = Y, 
+                                   missing_data = YNA, 
+                                   imputed_data = Y_mean_imp,
+                                   normalization = "missing")
+  }
+  
+  #### MICE
+  cat("MICE\n")
+  time_Mice_start <- proc.time()
+  nbimp_multmice <- 5
+  res_multmice <- mice(YNA, m = nbimp_multmice, maxit = 50)
+  ARI_Mice_vec <- numeric(nbimp_multmice)
+  Y_MultMice <- list()
+  
+  for (imult in 1:nbimp_multmice) {
+    Y_SingleMice <- mice::complete(res_multmice, imult)
+    Y_MultMice[[imult]] <- Y_SingleMice
+    run_singlemice <- "error"
+    it_singlemice <- 1
+    seed_singlemice <- 0
+    while (typeof(run_singlemice) == "character" & degen_Mice[it] < 15) {
+      run_singlemice <- EM_Gaussian_withoutNA(Y = data.matrix(Y_SingleMice), K = K, diag = diag,
+                                              rmax = rmax_EM, init = NULL, stop = stop_EM, tol = tol_EM)
+      if (typeof(run_singlemice) == "character") {
+        degen_Mice[it] <- degen_Mice[it] + 1
+      }
+      it_singlemice <- it_singlemice + 1
+      cat("MICE run:", it_singlemice, "\n")
+    }
+    if (typeof(run_singlemice) != "character") {
+      crit_MultMice <- Critere_Gaussian_withoutNA(run_singlemice, Y_SingleMice, Partition_true)
+      ARI_Mice_vec[imult] <- crit_MultMice$ARI
+    } else {
+      ARI_Mice_vec[imult] <- NA
+    }
+  }
+  ARI_Mice[it] <- mean(ARI_Mice_vec, na.rm = TRUE)
+  time_Mice_end <- proc.time()
+  time_Mice[it] <- (time_Mice_end - time_Mice_start)["elapsed"]
+  
+  # Calculate NRMSE for MICE (average across imputations)
+  nrmse_mice_values <- numeric(nbimp_multmice)
+  for (imult in 1:nbimp_multmice) {
+    nrmse_mice_values[imult] <- compute_nrmse(original_data = Y, 
+                                            missing_data = YNA, 
+                                            imputed_data = Y_MultMice[[imult]],
+                                            normalization = "missing")
+  }
+  nrmse_Mice[it] <- mean(nrmse_mice_values, na.rm = TRUE)
+  
+  #### Random Forest (missRanger)
+  cat("missRanger\n")
+  time_missRanger_start <- proc.time()
+  x_RF <- as.matrix(missRanger(as.data.frame(YNA), verbose = 0))
+  run_RF <- "error"
+  it_RF <- 1
+  while (it_RF <= Nbit_run & degen_missRanger[it] < 15) {
+    run_RF <- EM_Gaussian_withoutNA(Y = x_RF, K = K, diag = diag, rmax = rmax_EM,
+                                    init = NULL, stop = stop_EM, tol = tol_EM)
+    if (typeof(run_RF) == "character") {
+      degen_missRanger[it] <- degen_missRanger[it] + 1
+    } else {
+      break
+    }
+    it_RF <- it_RF + 1
+    cat("missRanger run:", it_RF, "\n")
+  }
+  time_missRanger_end <- proc.time()
+  time_missRanger[it] <- (time_missRanger_end - time_missRanger_start)["elapsed"]
+  
+  if (typeof(run_RF) == "character") {
+    ARI_missRanger[it] <- NA
+    nrmse_missRanger[it] <- NA
+  } else {
+    crit_RF <- Critere_Gaussian_withoutNA(run_RF, x_RF, Partition_true)
+    ARI_missRanger[it] <- crit_RF$ARI
+    
+    # Calculate NRMSE for Random Forest
+    nrmse_missRanger[it] <- compute_nrmse(original_data = Y, 
+                                        missing_data = YNA, 
+                                        imputed_data = x_RF,
+                                        normalization = "missing")
+  }
+  
+  #### SelvarClustLasso (without MNARz)
+  cat("SelvarClustLasso\n")
+  time_selvar_start <- proc.time()
+  res_selvar <- SelvarClustLasso(
+    x = YNA, 
+    nbcluster = 3,
+    models="mixmodGaussianModel(family=\"all\")",
+    rmodel = c("LB", "LI", "LC"), 
+    hsize = 2,
+    nbcores = min(4, detectCores()),
+    impute_missing = TRUE,
+    scale_data = TRUE,
+    use_missing_pattern = FALSE
+  )
+  x_selvar <- res_selvar$imputedData
+  run_selvar <- "error"
+  it_selvar <- 1
+  while (it_selvar <= Nbit_run & degen_selvar[it] < 15) {
+    run_selvar <- EM_Gaussian_withoutNA(Y = x_selvar, K = K, diag = diag, rmax = rmax_EM,
+                                    init = NULL, stop = stop_EM, tol = tol_EM)
+    if (typeof(run_selvar) == "character") {
+      degen_selvar[it] <- degen_selvar[it] + 1
+    } else {
+      break
+    }
+    it_selvar <- it_selvar + 1
+    cat("selvar run:", it_selvar, "\n")
+  }
+  time_selvar_end <- proc.time()
+  time_selvar[it] <- (time_selvar_end - time_selvar_start)["elapsed"]
+  
+  if (typeof(run_selvar) == "character") {
+    ARI_selvar[it] <- NA
+    nrmse_selvar[it] <- NA
+  } else {
+    crit_selvar <- Critere_Gaussian_withoutNA(run_selvar, x_selvar, Partition_true)
+    ARI_selvar[it] <- crit_selvar$ARI
+    
+    # Calculate NRMSE for SelvarClustLasso without MNARz
+    nrmse_selvar[it] <- compute_nrmse(original_data = Y, 
+                                     missing_data = missing_vals, 
+                                     imputed_data = x_selvar,
+                                     normalization = "missing")
+  }
+  
+  cat("Iteration", it, "completed.\n")
+}
+
+total_time_end <- proc.time()
+total_time <- (total_time_end - total_time_start)["elapsed"]
+
+# Mean performance metrics
+mean_ARI_selvarMNARz <- mean(ARI_selvarMNARz, na.rm = TRUE)
+mean_ARI_MNARz <- mean(ARI_MNARz, na.rm = TRUE)
+mean_ARI_Mean <- mean(ARI_Mean, na.rm = TRUE)
+mean_ARI_Mice <- mean(ARI_Mice, na.rm = TRUE)
+mean_ARI_missRanger <- mean(ARI_missRanger, na.rm = TRUE)
+mean_ARI_selvar <- mean(ARI_selvar, na.rm = TRUE)
+
+mean_time_MNARz <- mean(time_MNARz)
+mean_time_selvarMNARz <- mean(time_selvarMNARz)
+mean_time_Mean <- mean(time_Mean)
+mean_time_Mice <- mean(time_Mice)
+mean_time_missRanger <- mean(time_missRanger)
+mean_time_selvar <- mean(time_selvar)
+
+mean_nrmse_MNARz <- mean(nrmse_MNARz, na.rm = TRUE)
+mean_nrmse_selvarMNARz <- mean(nrmse_selvarMNARz, na.rm = TRUE)
+mean_nrmse_Mean <- mean(nrmse_Mean, na.rm = TRUE)
+mean_nrmse_Mice <- mean(nrmse_Mice, na.rm = TRUE)
+mean_nrmse_missRanger <- mean(nrmse_missRanger, na.rm = TRUE)
+mean_nrmse_selvar <- mean(nrmse_selvar, na.rm = TRUE)
+
+cat("\n=== RESULTS ===\n")
+cat("Performance Metrics:\n")
+cat("Mean ARI MNARz:", mean_ARI_MNARz, "\n")
+cat("Mean ARI SelvarClustLasso MNARz:", mean_ARI_selvarMNARz, "\n")
+cat("Mean ARI Mean Imputation:", mean_ARI_Mean, "\n")
+cat("Mean ARI MICE:", mean_ARI_Mice, "\n")
+cat("Mean ARI Random Forest:", mean_ARI_missRanger, "\n")
+cat("Mean ARI SelvarClustLasso:", mean_ARI_selvar, "\n\n")
+
+cat("Imputation Quality (NRMSE):\n")
+cat("Mean NRMSE MNARz:", mean_nrmse_MNARz, "\n")
+cat("Mean NRMSE SelvarClustLasso MNARz:", mean_nrmse_selvarMNARz, "\n")
+cat("Mean NRMSE Mean Imputation:", mean_nrmse_Mean, "\n")
+cat("Mean NRMSE MICE:", mean_nrmse_Mice, "\n")
+cat("Mean NRMSE Random Forest:", mean_nrmse_missRanger, "\n")
+cat("Mean NRMSE SelvarClustLasso:", mean_nrmse_selvar, "\n\n")
+
+cat("Running Times:\n")
+cat("Mean Time MNARz (seconds):", mean_time_MNARz, "\n")
+cat("Mean Time SelvarClustLasso MNARz (seconds):", mean_time_selvarMNARz, "\n")
+cat("Mean Time Mean Imputation (seconds):", mean_time_Mean, "\n")
+cat("Mean Time MICE (seconds):", mean_time_Mice, "\n")
+cat("Mean Time Random Forest (seconds):", mean_time_missRanger, "\n")
+cat("Mean Time SelvarClustLasso (seconds):", mean_time_selvar, "\n")
+cat("Total Running Time (seconds):", total_time, "\n")
+
+# Full results
+results <- data.frame(
+  Iteration = 1:nb_it,
+  # ARI values
+  ARI_MNARz = ARI_MNARz,
+  ARI_selvarMNARz = ARI_selvarMNARz,
+  ARI_Mean = ARI_Mean,
+  ARI_Mice = ARI_Mice,
+  ARI_missRanger = ARI_missRanger,
+  ARI_selvar = ARI_selvar,
+  # NRMSE values
+  NRMSE_MNARz = nrmse_MNARz,
+  NRMSE_selvarMNARz = nrmse_selvarMNARz,
+  NRMSE_Mean = nrmse_Mean,
+  NRMSE_Mice = nrmse_Mice,
+  NRMSE_missRanger = nrmse_missRanger,
+  NRMSE_selvar = nrmse_selvar,
+  # Time values
+  Time_MNARz = time_MNARz,
+  Time_selvarMNARz = time_selvarMNARz,
+  Time_Mean = time_Mean,
+  Time_Mice = time_Mice,
+  Time_missRanger = time_missRanger,
+  Time_selvar = time_selvar
+)
+
+# Summary results
+summary_results <- data.frame(
+  Method = c("MNARz", "SelvarClustLasso MNARz", "Mean", "MICE", "Random Forest", "SelvarClustLasso"),
+  Mean_ARI = c(mean_ARI_MNARz, mean_ARI_selvarMNARz, mean_ARI_Mean, mean_ARI_Mice, mean_ARI_missRanger, mean_ARI_selvar),
+  Mean_NRMSE = c(mean_nrmse_MNARz, mean_nrmse_selvarMNARz, mean_nrmse_Mean, mean_nrmse_Mice, mean_nrmse_missRanger, mean_nrmse_selvar),
+  Mean_Time = c(mean_time_MNARz, mean_time_selvarMNARz, mean_time_Mean, mean_time_Mice, mean_time_missRanger, mean_time_selvar)
+)
+
+summary_results <- summary_results[order(-summary_results$Mean_ARI), ]
+
+# Generate a simple boxplot of ARI values if desired
+if (interactive()) {
+  boxplot(
+    ARI_MNARz, ARI_selvarMNARz, ARI_Mean, ARI_Mice, ARI_missRanger, ARI_selvar,
+    names = c("MNARz", "SelMNARz", "Mean", "MICE", "RF", "Selvar"),
+    main = "ARI Comparison Across Methods",
+    ylab = "Adjusted Rand Index",
+    col = c("blue", "lightblue", "red", "green", "purple", "orange")
+  )
+}
+
+# Save results to files
+detailed_filename <- paste0("exp_", d, "_20_", missing_pattern, "_full_sportisse_detailed.csv")
+summary_filename <- paste0("exp_", d, "_20_", missing_pattern, "_full_sportisse_summary.csv")
+
+write.csv(results, detailed_filename, row.names = FALSE)
+write.csv(summary_results, summary_filename, row.names = FALSE)
+```
+
+### Reading result
+```{r}
+base_dir <- "D:/RProject/MissingData_MOE/result"
+results <- read_experiment_files(base_dir)
+
+d6_MNARz_detailed <- results$detailed$d6_MNARz_detailed
+d6_MNARyz_detailed <- results$detailed$d6_MNARyz_detailed
+d6_MNARy_detailed <- results$detailed$d6_MNARy_detailed
+
+d9_MNARz_detailed <- results$detailed$d9_MNARz_detailed
+d9_MNARyz_detailed <- results$detailed$d9_MNARyz_detailed
+d9_MNARy_detailed <- results$detailed$d9_MNARy_detailed
+
+d6_MNARz_summary <- results$summary$d6_MNARz_summary
+d6_MNARyz_summary <- results$summary$d6_MNARyz_summary
+d6_MNARy_summary <- results$summary$d6_MNARy_summary
+
+d9_MNARz_summary <- results$summary$d9_MNARz_summary
+d9_MNARyz_summary <- results$summary$d9_MNARyz_summary
+d9_MNARy_summary <- results$summary$d9_MNARy_summary
+
+
+sportisse_detailed <- do.call(rbind, results$detailed)
+
+
+plot_data_ARI <- prepare_plotting_data(sportisse_detailed)
+plot_data_NRMSE <- prepare_plotting_data(sportisse_detailed, metric_type = "NRMSE")
+
+ari_plot <- create_metric_plot(plot_data_ARI, y_limit = c(0,1), h_line = 0.9)
+nrmse_plot <- create_metric_plot(plot_data_NRMSE, metric = "NRMSE")
+
+ari_plot
+nrmse_plot
+```
+
+## Extreme case analysis
+```{r, warning=F, message=F}
+create_pattern_based <- function(data, perc_missing) {
+  # 1 = observed, 0 = missing
+  patterns <- matrix(1, nrow = 1, ncol = ncol(data))
+  patterns[1, 1:2] <- 0
+  
+  # Define weights to make pattern dominant
+  freq.patterns <- 0.8 # 1 create error 
+  
+  result <- produce_NA(data, 
+                      mechanism = "MNAR",  # Option: MNAR, MAR
+                      perc.missing = perc_missing,
+                      by.patterns = TRUE,
+                      patterns = patterns,
+                      freq.patterns = freq.patterns)
+  
+  return(result$data.incomp)
+}
+
+evaluate_clustering <- function(data_incomplete, true_clusters, true_labels) {
+  model_result <- SelvarClustLasso(
+    x = data_incomplete, 
+    nbcluster = 2:4,
+    rmodel = c("LB", "LI"), 
+    hsize = 2,
+    nbcores = min(4, detectCores()),
+    impute_missing = TRUE,
+    scale_data = TRUE,
+    use_missing_pattern = TRUE,
+    use_mnarz = FALSE
+  )
+  imputed_data <- model_result$imputedData
+  predicted_labels <- model_result$partition
+  relevant_vars <- paste(model_result$S, collapse = ", ")
+  bic <- model_result$criterionValue
+  n_clusters <- model_result$nbcluster
+  
+  selected_vars <- model_result$S
+  # Calculate adjusted Rand index to compare with true clusters
+  ari <- adjustedRandIndex(true_labels, predicted_labels)
+  # Return results
+  return(list(
+    selected_vars = selected_vars,
+    contains_var1 = 1 %in% selected_vars,
+    contains_var2 = 2 %in% selected_vars,
+    contains_only_relevant = all(selected_vars %in% c(1, 2)) && length(selected_vars) == 2,
+    selected_n_clusters = (n_clusters==4),
+    ari = ari
+  ))
+}
+
+data_maugis_2019 <- simulate_Maugis_data2019(scenario = 8)
+data_maugis_2019_pattern <- create_pattern_based(data_maugis_2019$data, 0.2)
+result_extreme <- evaluate_clustering(data_maugis_2019_pattern, 4, data_maugis_2019$class)
+print(result_extreme)
+```
+
+
+
+### Single method running
+```{r, warning=F, message=F}
+d_values <- c(6, 9)
+missing_patterns <- c("MNARz", "MNARy", "MNARyz")
+
+# Create dataframe to store all results
+all_results <- data.frame()
+
+for (curr_d in d_values) {
+  for (curr_pattern in missing_patterns) {
+    cat("\n===========================================\n")
+    cat("Running experiment with d =", curr_d, "and pattern =", curr_pattern, "\n")
+    cat("===========================================\n\n")
+    
+    # Experimental settings
+    n <- 100
+    K <- 3
+    pik <- c(0.5, 0.25, 0.25) 
+    d <- curr_d   
+    missing_pattern <- curr_pattern  
+    tau <- 2.31
+    
+    # Define delta: interaction signals for each cluster & variable
+    delta <- matrix(0, nrow = K, ncol = d)
+    # Set first 3 variables as discriminative regardless of d
+    delta[1, 1] <- tau 
+    delta[2, 2] <- tau
+    delta[3, 3] <- tau
+    
+    if (d >= 6) {
+      delta[1, 4] <- tau
+      delta[2, 5] <- tau
+      delta[3, 6] <- tau
+    }
+    
+    # Missing mechanism parameters 
+    probmiss_z <- matrix(0, nrow = K, ncol = d, byrow = TRUE)
+    probmiss_y <- rep(c(1.45, 0.2, -3), length.out = d)
+    intercept_y <- -1.38
+    
+    # EM algorithm settings
+    rmax_EM <- 60
+    stop_EM <- "classical"
+    tol_EM <- 0.001
+    diag <- TRUE
+    Nbit_run <- 3
+    nb_it <- 20
+    
+    # Performance metrics
+    ARI_MCAR <- numeric(nb_it)
+    degen_MCAR <- numeric(nb_it)
+    time_MCAR <- numeric(nb_it)
+    nrmse_MCAR <- numeric(nb_it)
+    
+    ARI_selvarMNARz <- numeric(nb_it)
+    degen_selvarMNARz <- numeric(nb_it)
+    time_selvarMNARz <- numeric(nb_it)
+    nrmse_selvarMNARz <- numeric(nb_it)
+    
+    
+    for (it in 1:nb_it) {
+      cat("ITERATION:", it, "- d =", d, "- pattern =", missing_pattern, "\n")
+      set.seed(it + 1000*(which(d_values == curr_d) - 1) + 100*(which(missing_patterns == curr_pattern) - 1))
+      
+      # --- Simulate True Cluster Membership and Data ---
+      Z <- SimuZ(n = n, pik = pik)
+      Partition_true <- apply(Z, 1, function(z) which(z == 1))
+      
+      Y <- matrix(NA, nrow = n, ncol = d)
+      for (j in 1:d) {
+        Y[, j] <- Z %*% delta[, j] + rnorm(n)
+      }
+      
+      # Introduce missing data using specified mechanism
+      C <- SimuC(pik, Y, Z, missing_pattern, probmiss_z = probmiss_z, 
+                 probmiss_y = probmiss_y, intercept_y = intercept_y)
+      YNA <- Y
+      YNA[C] <- NA
+      
+      # Ensure no observation is completely missing
+      for (i in 1:n) {
+        if (sum(is.na(YNA[i, ])) == d) {
+          num <- sample(1:d, 1)
+          YNA[i, num] <- Y[i, num]
+        }
+      }
+      
+      ### EM MCAR
+      # cat("  Running MCAR method\n")
+      # time_MCAR_start <- proc.time()
+      # run_MCAR <- list()
+      # it_MCAR <- 1
+      # while (it_MCAR <= Nbit_run & degen_MCAR[it] < 10) {
+      #   res_MCAR <- EM_Gaussian(YNA = YNA, K = K, mecha = "MCAR", diag = diag, 
+      #                           rmax = rmax_EM, init = NULL, stop = stop_EM, tol = tol_EM)
+      #   if (typeof(res_MCAR) == "character") {
+      #     degen_MCAR[it] <- degen_MCAR[it] + 1
+      #   } else {
+      #     run_MCAR[[it_MCAR]] <- res_MCAR
+      #     it_MCAR <- it_MCAR + 1
+      #   }
+      # }
+      # time_MCAR_end <- proc.time()
+      # time_MCAR[it] <- (time_MCAR_end - time_MCAR_start)["elapsed"]
+      # 
+      # if (typeof(res_MCAR) == "character" || length(run_MCAR) == 0) {
+      #   ARI_MCAR[it] <- NA
+      #   nrmse_MCAR[it] <- NA
+      # } else {
+      #   crit_MCAR <- lapply(run_MCAR, Critere_Gaussian, YNA = YNA, Partition_true = Partition_true, mecha = "MCAR")
+      #   whmax_MCAR <- which.max(sapply(crit_MCAR, function(x) x$ICL))
+      #   ARI_MCAR[it] <- crit_MCAR[[whmax_MCAR]]$ARI
+      #   
+      #   # Calculate NRMSE for MCAR
+      #   best_run <- run_MCAR[[whmax_MCAR]]
+      #   Y_imputed_MCAR <- best_run$imputedData
+      #   nrmse_MCAR[it] <- compute_nrmse(original_data = Y, 
+      #                                  missing_data = YNA, 
+      #                                  imputed_data = Y_imputed_MCAR,
+      #                                  normalization = "missing")
+      # }
+      #### SelvarClustLasso MNARz
+      cat("SelvarClustLasso MNARz\n")
+      time_selvarMNARz_start <- proc.time()
+      run_selvarMNARz <- list()
+      it_selvarMNARz <- 1
+      while (it_selvarMNARz <= Nbit_run & degen_selvarMNARz[it] < 10) {
+        res_selvarMNARz <- SelvarClustLasso(
+        x = YNA,
+        nbcluster = 3,
+        # models="mixmodGaussianModel(family=\"all\")",
+        models = "VVV",
+        # models = "gaussian_pk_sjk",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = 2,
+        nbcores = min(4, detectCores()),
+        impute_missing = TRUE,
+        scale_data = TRUE,
+        use_missing_pattern = TRUE
+      )
+        if (typeof(res_selvarMNARz) == "character") {
+          degen_selvarMNARz[it] <- degen_selvarMNARz[it] + 1
+        } else {
+          res_selvarMNARz_clean <- list(pik=res_selvarMNARz$parametersMNARz$parameters$pik, 
+                                  mu=res_selvarMNARz$parametersMNARz$parameters$mu, 
+                                  sigma=res_selvarMNARz$parametersMNARz$parameters$sigma,
+                                  alpha=res_selvarMNARz$parametersMNARz$parameters$alpha, 
+                                  beta=matrix(0,nrow=K,ncol=d))
+          run_selvarMNARz[[it_selvarMNARz]] <- res_selvarMNARz_clean
+          it_selvarMNARz <- it_selvarMNARz + 1
+          
+          # Store the imputed data for NRMSE calculation
+          if (it_selvarMNARz == 2) {
+            Y_imputed_selvarMNARz <- res_selvarMNARz$imputedData
+          }
+        }
+        cat("SelvarClustLasso MNARz run:", it_selvarMNARz, "\n")
+      }
+      time_selvarMNARz_end <- proc.time()
+      time_selvarMNARz[it] <- (time_selvarMNARz_end - time_selvarMNARz_start)["elapsed"]
+      
+      if (typeof(res_selvarMNARz) == "character") {
+        ARI_selvarMNARz[it] <- NA
+        nrmse_selvarMNARz[it] <- NA
+      } else {
+        crit_selvarMNARz <- lapply(run_selvarMNARz, Critere_Gaussian, 
+                             YNA = YNA, Partition_true = Partition_true, 
+                             mecha = "MNARz")
+        whmax_selvarMNARz <- which.max(sapply(crit_selvarMNARz, function(x) x$ICL))
+        ARI_selvarMNARz[it] <- crit_selvarMNARz[[whmax_selvarMNARz]]$ARI
+        
+        # Calculate NRMSE for SelvarClustLasso
+        nrmse_selvarMNARz[it] <- compute_nrmse(original_data = Y, 
+                                              imputed_data = Y_imputed_selvarMNARz,
+                                              missing_data = YNA, 
+                                              normalization = "missing")
+      }
+          
+        }
+        
+        result_df <- data.frame(
+          d = rep(d, nb_it),
+          missing_pattern = rep(missing_pattern, nb_it),
+          iteration = 1:nb_it,
+          ARI_MCAR = ARI_MCAR,
+          nrmse_MCAR = nrmse_MCAR,
+          time_MCAR = time_MCAR,
+          degen_MCAR = degen_MCAR
+        )
+        all_results <- rbind(all_results, result_df)
+        
+        saveRDS(result_df, file = paste0("results_MCAR_d", d, "_", missing_pattern, ".rds"))
+        
+      } 
+    } 
+
+# saveRDS(all_results, file = "all_MCAR_results.rds")
+# write.csv(all_results, file = "all_MCAR_results.csv", row.names = FALSE)
+
+summary_results <- all_results %>%
+  group_by(d, missing_pattern) %>%
+  summarize(
+    mean_ARI = mean(ARI_selvarMNARz, na.rm = TRUE),
+    mean_nrmse= mean(nrmse_selvarMNARz, na.rm = TRUE),
+    mean_time = mean(time_selvarMNARz, na.rm = TRUE)
+  )
+
+# saveRDS(summary_results, file = "summary_MCAR_results.rds")
+# write.csv(summary_results, file = "summary_MCAR_results.csv", row.names = FALSE)
+
+cat("\nExperiment completed.\n")
+```
+
+
+## Benchmark on real dataset (ESM paper)
+### GCPC
+```{r, message=F, warning=F}
+data("Hawks")
+na_rate <- 0.2
+# Extract features and true clusters
+data_hawks <- as.matrix(Hawks[, 10:14])
+true_clus_hawks <- as.numeric(Hawks[, 7])
+
+data_maugis_2012 <- simulate_Maugis_data2012()
+data_maugis_2019 <- simulate_Maugis_data2019(scenario = 6)
+data_maugis_missing_2012 <- produce_NA(data_maugis_2012$data, mechanism = "MNAR", perc.missing = 0.1)$data.incomp
+data_maugis_missing_2019 <- produce_NA(data_maugis_2019$data, mechanism = "MNAR", perc.missing = 0.1)$data.incomp
+
+# res_maugis_gcpc <- GCPC(data_maugis_2019$data, k=4,M=3,csh=100,cvol=100,niter=250,tol=10^(-8),nstart=10,graph=F)
+
+
+res_maugis_selvar1 <- SelvarClustLasso(
+        x = data_maugis_missing_2019,
+        nbcluster = 2:4,
+        # models="mixmodGaussianModel(family=\"general\")",
+        # models = "mixmodGaussianModel(listModels = c(\"Gaussian_pk_B\"))",
+        # models="gaussian_pk_sjk",
+        models = "VVV",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = 3,
+        nbcores = 4,
+        impute_missing = TRUE,
+        scale_data = TRUE,
+        use_missing_pattern = TRUE
+      )
+
+res_maugis_selvar4 <- SelvarClustLasso(
+        x = data_maugis_missing_2019,
+        nbcluster = 2:4,
+        # models="mixmodGaussianModel(family=\"general\")",
+        # models = "mixmodGaussianModel(listModels = c(\"Gaussian_pk_B\"))",
+        # models="gaussian_pk_sjk",
+        models = "VVV",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = 3,
+        nbcores = 4,
+        impute_missing = TRUE,
+        use_copula = FALSE,
+        scale_data = TRUE,
+        use_missing_pattern = TRUE
+      )
+
+res_maugis_selvar2 <- SelvarClustLasso(
+        x = data_maugis_missing_2019,
+        nbcluster = 2:4,
+        models="mixmodGaussianModel(family=\"general\")",
+        # models = "mixmodGaussianModel(listModels = c(\"Gaussian_pk_B\"))",
+        # models="gaussian_pk_sjk",
+        # models = "VVV",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = 3,
+        nbcores = 4,
+        impute_missing = TRUE,
+        scale_data = TRUE,
+        use_missing_pattern = TRUE
+      )
+
+res_maugis_selvar3 <- SelvarClustLasso(
+        x = data_maugis_missing_2019,
+        nbcluster = 2:4,
+        # models="mixmodGaussianModel(family=\"general\")",
+        # models = "mixmodGaussianModel(listModels = c(\"Gaussian_pk_B\"))",
+        models="gaussian_pk_sjk",
+        # models = "VVV",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = 3,
+        nbcores = 4,
+        impute_missing = TRUE,
+        scale_data = TRUE,
+        use_missing_pattern = TRUE
+      )
+
+compute_nrmse(data_maugis_2019$data, res_maugis_selvar1$imputedData, data_maugis_missing_2019)
+adjustedRandIndex(res_maugis_selvar1$partition, data_maugis_2019$class)
+
+compute_nrmse(data_maugis_2019$data, res_maugis_selvar4$imputedData, data_maugis_missing_2019)
+adjustedRandIndex(res_maugis_selvar4$partition, data_maugis_2019$class)
+
+
+compute_nrmse(data_maugis_2019$data, res_maugis_selvar2$imputedData, data_maugis_missing_2019)
+adjustedRandIndex(res_maugis_selvar2$partition, data_maugis_2019$class)
+
+compute_nrmse(data_maugis_2019$data, res_maugis_selvar3$imputedData, data_maugis_missing_2019)
+adjustedRandIndex(res_maugis_selvar3$partition, data_maugis_2019$class)
+
+
+sourceCpp("D:\\RProject\\MissingData_MOE\\MclustWrapper.cpp")
+sourceCpp("D:\\RProject\\MissingData_MOE\\CritclustWrapper.cpp")
+
+numExp <- 1:7
+k <- 4
+
+result_mclust <- critClustWrapper(data_maugis_2012$data, numExp, k, "Mclust", "VVI")
+print(result_mclust$criterionValue)
+
+result_rmixmod <- critClustWrapper(data_maugis_2012$data, numExp, k, "Rmixmod", "mixmodGaussianModel(listModels = c(\"Gaussian_pk_Lk_Bk\"))")
+print(result_rmixmod$criterionValue)
+
+result_mixall <- critClustWrapper(data_maugis_2012$data, numExp, k, "MixAll", "gaussian_pk_sjk")
+print(result_mixall$criterionValue)
+
+
+res_maugis_bgmm <-  mModelList(X = data_maugis_2012$data, 
+                               kList = 2:4, mean = c("D", "E"), between = c("D", "E"),
+                               within = c("D", "E"), cov = c("D", "0"), 
+                               funct = unsupervised)
+
+res_maugis_mclust <- Mclust(data=data_maugis_2012$data[,6],
+                                 G=2:4,
+                                initialization = list(hcPairs = hc("VVV", 
+                                                                   data = data_maugis_2012$data)))
+
+res_MGMM <- FitGMM(as.matrix(data_maugis_2019$data), k=4, report = FALSE)
+ari_maugis2012_mgmm <- adjustedRandIndex(res_MGMM@Assignments[,1], data_maugis_2019$class)
+ari_maugis2012_mgmm
+
+ari_maugis2012_selvar <- adjustedRandIndex(res_maugis_selvar$partition, data_maugis_2019$class)
+ari_maugis2012_selvar
+
+ari_maugis2012_gcpc <- adjustedRandIndex(apply(res_maugis_gcpc$posterior, 1, which.max), data_maugis_2019$class)
+ari_maugis2012_gcpc
+
+# 0.925: Maugis
+# 0.921: GCPC 
+# 0.291: MGMM
+# Weakness of GCPC: many hyperparameters 
+# 
+
+
+```
+
+```{r}
+library(HDclassif)
+library(ContaminatedMixt)
+data(Crabs)
+data_ESM_obj <- simulate_ESM_data()
+nb_it <- 10
+data_ESM <- data_ESM_obj$data
+true_labels <- data_ESM_obj$labels
+ARI_selvarMNARz <- numeric(nb_it)
+time_selvarMNARz <- numeric(nb_it)
+feature_selection_accuracy <- numeric(nb_it)
+
+
+for (it in 1:nb_it) {
+  #### SelvarClustLasso MNARz
+  cat("SelvarClustLasso MNARz\n")
+  time_selvarMNARz_start <- proc.time()
+  
+  # Run the model once since it's already robust
+  res_selvarMNARz <- SelvarClustLasso(
+    x = data_ESM, 
+    nbcluster = 2:4,
+    rmodel = c("LB", "LI"),
+    hsize = 2,
+    nbcores = min(4, detectCores()),
+    impute_missing = FALSE, 
+    scale_data = TRUE
+  )
+  
+  time_selvarMNARz_end <- proc.time()
+  time_selvarMNARz[it] <- (time_selvarMNARz_end - time_selvarMNARz_start)["elapsed"]
+  
+  # Check if a valid result was obtained
+  if (typeof(res_selvarMNARz) == "character" || is.null(res_selvarMNARz)) {
+    ARI_selvarMNARz[it] <- NA
+    feature_selection_accuracy[it] <- NA
+    cat("No valid result obtained for iteration", it, "\n")
+  } else {
+    # Calculate ARI if partition information exists
+    if (!is.null(res_selvarMNARz$partition)) {
+      ARI_selvarMNARz[it] <- adjustedRandIndex(res_selvarMNARz$partition, true_labels)
+    } else {
+      ARI_selvarMNARz[it] <- NA
+      cat("Cluster information missing in the result\n")
+    }
+    
+    # Calculate feature selection accuracy if selection information exists
+    if (!is.null(res_selvarMNARz$S)) {
+      true_relevant <- data_ESM_obj$relevant_idx
+      selected_relevant <- res_selvarMNARz$S
+      
+      # For perfect match (only true relevant variables selected)
+      perfect_match <- length(selected_relevant) == length(true_relevant) && 
+                       all(sort(selected_relevant) == sort(true_relevant))
+      
+      # Store the accuracy metrics
+      feature_selection_accuracy[it] <- if(perfect_match) 1 else 0
+    } else {
+      feature_selection_accuracy[it] <- NA
+      cat("Feature selection information missing in the result\n")
+    }
+  }
+  
+  # Print progress
+  cat("Iteration", it, "completed. ARI:", ARI_selvarMNARz[it], "\n")
+  cat("Selected variables:", paste(selected_relevant, collapse = ", "), "\n")
+  }
+# exp_10_esm_simulated <- list(ARI_selvarMNARz, feature_selection_accuracy)
+# saveRDS(exp_10_esm_simulated, file="result/esm/exp_10_esm_simulated.rds")
+
+# #============== Wine dataset =============
+# wine_dat <- as.data.frame(scale(wine[,-1]))
+# wine_dat_missing <- produce_NA(wine_dat, mechanism = "MAR", perc.missing = 0.1)$data.incomp
+# wine_dat_imputed <- imputeData(wine_dat_missing)
+# 
+# # VVE - Ellipsodial, Equal orientation
+# res_wine_selvar <- SelvarClustLasso(
+#     x = scale(wine[,-1]), 
+#     nbcluster = 2:4,
+#     # models = "mixmodGaussianModel(listModels = c(\"Gaussian_pk_Lk_Bk\"))",
+#     # models = "mixmodGaussianModel(family=\"diagonal\")",
+#     # models = "gaussian_pk_s",
+#     models = "VVE",
+#     rmodel = c("LB", "LI", "LC"),
+#     hsize = 3,
+#     nbcores = min(6, detectCores()),
+#     impute_missing = FALSE, 
+#     scale_data = TRUE
+#   )
+# ari_wine_selvar <- adjustedRandIndex(as.numeric(wine[,1]), res_wine_selvar$partition)
+# ari_wine_selvar
+# 
+# 
+# res_wine_mclust <- Mclust(wine_dat_imputed,
+#                                 G=3,
+#                                 initialization = list(hcPairs = hc("VVV", 
+#                                                                    data = wine_dat_imputed)))
+# 
+# 
+# res_wine_mixmod <- mixmodCluster(
+#   wine_dat, 2:4,
+#   models = mixmodGaussianModel(listModels = c("Gaussian_pk_Lk_Bk")),
+#   strategy = mixmodStrategy(algo = "EM",
+#                               nbIterationInAlgo = 200, 
+#                               nbTryInInit = 100,
+#                               epsilonInAlgo = 1e-7,
+#                               initMethod = "SEMMax",
+#                               nbIterationInInit = 10,
+#                               nbTry = 2))
+# 
+# res_wine_varselcluster <- VarSelCluster(x = scale(wine[,-1]),
+#                                         gvals = 2:4,
+#                                         vbleSelec = TRUE)
+# res_wine_clustvarsel <- clustvarsel(
+#         scale(wine[,-1]),
+#         G = 2:4,
+#         search = "greedy",
+#         direction = "backward",
+#         allow.EEE = TRUE,
+#         forcetwo = FALSE,
+#         parallel = FALSE  
+#       )
+# 
+# res_wine_vscc <- vscc(scale(wine[,-1]), G=2:4)
+#       
+# ari_wine_clustvarsel <- adjustedRandIndex(res_wine_clustvarsel$model$classification, as.numeric(wine[,1]))
+# ari_wine_selvar <- adjustedRandIndex(as.numeric(wine[,1]), res_wine_selvar$partition)
+# ari_wine_varselcluster <- adjustedRandIndex(res_wine_varselcluster@partitions@zMAP, as.numeric(wine[,1]))
+# ari_wine_vscc <- adjustedRandIndex(res_wine_vscc$bestmodel$classification, as.numeric(wine[,1]))
+# ari_wine_mclust <- adjustedRandIndex(as.numeric(wine[,1]), res_wine_mclust$classification)
+# ari_wine_mixmod <- adjustedRandIndex(as.numeric(wine[,1]), res_wine_mixmod@bestResult@partition)
+# 
+# ari_wine_list <- c(ari_wine_selvar, ari_wine_clustvarsel, ari_wine_varselcluster, 
+#               ari_wine_vscc, ari_wine_mclust, ari_wine_mixmod)
+# ari_wine_list
+
+
+
+
+#========== Crabs dataset ===========
+# EVV - Equal volume
+res_crabs_selvar <- SelvarClustLasso(
+    x = scale(Crabs[,-1]),
+    nbcluster = 2:4,
+    # models = "mixmodGaussianModel(listModels = c(\"Gaussian_pk_L_Dk_Ak_Dk\"))",
+    # models="mixmodGaussianModel(family=\"general\")",
+    models = "EVV",
+    # models = "gaussian_pk_sj",
+    rmodel = c("LB", "LI", "LC"),
+    hsize = 2,
+    nbcores = min(4, detectCores()),
+    impute_missing = FALSE,
+    scale_data = FALSE
+  )
+
+ari_crabs_selvar <- adjustedRandIndex(res_crabs_selvar$partition, as.numeric(Crabs[,1]))
+ari_crabs_selvar
+
+# res_crabs_gprop <- GPROP(as.matrix(scale(Crabs[,-1])), k=4,M=3,csh=100,cvol=100,niter=250,tol=10^(-8),nstart=10,graph=F)
+# 
+# res_wine_gcpc <- GCPC(as.matrix(scale(Crabs[,-1])), k=4,M=3,csh=100,cvol=100,niter=250,tol=10^(-8),nstart=10,graph=F)
+# 
+# cluster_crabs_gcpc <- apply(res_crabs_gcpc$posterior,1,which.max)
+# ari_crabs_gcpc <- adjustedRandIndex(cluster_crabs_gcpc,
+#                                     as.numeric(Crabs[,1]))
+# ari_crabs_gcpc
+# 
+# cluster_crabs_gprop <- apply(res_crabs_gprop$posterior,1,which.max)
+# ari_crabs_gprop <- adjustedRandIndex(cluster_crabs_gprop,
+#                                     as.numeric(Crabs[,1]))
+# ari_crabs_gprop
+
+
+res_crabs_mixmod <- mixmodCluster(
+  as.data.frame(scale(Crabs[,-1])), 2:4,
+  models = mixmodGaussianModel(listModels = c("Gaussian_pk_L_Dk_A_Dk",
+                                              "Gaussian_pk_L_D_Ak_D",
+                                              "Gaussian_pk_L_Ck")),
+  strategy = mixmodStrategy(algo = c("EM", "SEM"),
+                              nbIterationInAlgo = c(200, 100),
+                              epsilonInAlgo = c(NA, 1e-04),
+                              initMethod = "SEMMax",
+                              nbTry = 2))
+
+res_crabs_mclust <- Mclust(scale(Crabs[,-1]),
+                                 G=2:4,
+                                initialization = list(hcPairs = hc("VVV", 
+                                                                   data = scale(Crabs[,-1]))))
+
+# s4_crabs_mclust <- convertListToS4(res_crabs_mclust, "MixAll")
+
+res_crabs_mixture <- gpcm(data=scale(Crabs[,-1]),
+                          G=2:4, start = 2)
+
+res_crabs_varselcluster <- VarSelCluster(x = scale(Crabs[,-1]),
+                                        gvals = 2:4,
+                                        vbleSelec = TRUE)
+
+res_crabs_clustvarsel <- clustvarsel(
+        scale(Crabs[,-1]),
+        G = 2:4,
+        search = "greedy",
+        direction = "forward",
+        allow.EEE = TRUE,
+        forcetwo = FALSE,
+        parallel = FALSE
+      )
+
+res_crabs_vscc <- vscc(scale(Crabs[,-1]), G=2:4)
+      
+ari_crabs_clustvarsel <- adjustedRandIndex(res_crabs_clustvarsel$model$classification, as.numeric(Crabs[,1]))
+ari_crabs_selvar <- adjustedRandIndex(res_crabs_selvar$partition, as.numeric(Crabs[,1]))
+ari_crabs_varselcluster <- adjustedRandIndex(res_crabs_varselcluster@partitions@zMAP, as.numeric(Crabs[,1]))
+ari_crabs_vscc <- adjustedRandIndex(res_crabs_vscc$bestmodel$classification, as.numeric(Crabs[,1]))
+ari_crabs_mclust <- adjustedRandIndex(res_crabs_mclust$classification, as.numeric(Crabs[,1]))
+ari_crabs_mixture <- adjustedRandIndex(res_crabs_mixture$best_model$map, as.numeric(Crabs[,1]))
+ari_crabs_mixmod <- adjustedRandIndex(res_crabs_mixmod@bestResult@partition, 
+                                      as.numeric(Crabs[,1]))
+
+ari_crabs_list <- c(ari_crabs_selvar, 
+              ari_crabs_mixture, ari_crabs_clustvarsel, 
+              ari_crabs_varselcluster, ari_crabs_vscc, 
+              ari_crabs_mclust, ari_crabs_mixmod)
+ari_crabs_list
+# saveRDS(ari_crabs_list, "result/exp_crabs_all.rds")
+# result <- readRDS("result/esm/exp_10_esm_simulated.rds")
+
+
+#============== Geyser dataset ============
+# EVV - Equal volume
+res_geyser_selvar <- SelvarClustLasso(
+    x = scale(geyser),
+    nbcluster = 2:4,
+    # models = "mixmodGaussianModel(listModels = c(\"Gaussian_pk_L_Dk_Ak_Dk\"))",
+    models="mixmodGaussianModel(family=\"general\")",
+    # models = "EEE",
+    # models = "gaussian_pk_sj",
+    rmodel = c("LB", "LI", "LC"),
+    hsize = 1,
+    nbcores = min(1, detectCores()),
+    impute_missing = FALSE,
+    scale_data = FALSE
+  )
+
+ari_geyser_selvar <- adjustedRandIndex(res_crabs_selvar$partition, as.numeric(Crabs[,1]))
+ari_geyser_selvar
+
+# res_crabs_gprop <- GPROP(as.matrix(scale(Crabs[,-1])), k=4,M=3,csh=100,cvol=100,niter=250,tol=10^(-8),nstart=10,graph=F)
+# 
+# res_wine_gcpc <- GCPC(as.matrix(scale(Crabs[,-1])), k=4,M=3,csh=100,cvol=100,niter=250,tol=10^(-8),nstart=10,graph=F)
+# 
+# cluster_crabs_gcpc <- apply(res_crabs_gcpc$posterior,1,which.max)
+# ari_crabs_gcpc <- adjustedRandIndex(cluster_crabs_gcpc,
+#                                     as.numeric(Crabs[,1]))
+# ari_crabs_gcpc
+# 
+# cluster_crabs_gprop <- apply(res_crabs_gprop$posterior,1,which.max)
+# ari_crabs_gprop <- adjustedRandIndex(cluster_crabs_gprop,
+#                                     as.numeric(Crabs[,1]))
+# ari_crabs_gprop
+
+
+res_geyser_mixmod <- mixmodCluster(
+  as.data.frame(scale(geyser)), 2:4,
+  models = mixmodGaussianModel(listModels = c("Gaussian_pk_L_Dk_A_Dk",
+                                              "Gaussian_pk_L_D_Ak_D",
+                                              "Gaussian_pk_L_Ck")),
+  strategy = mixmodStrategy(algo = c("EM", "SEM"),
+                              nbIterationInAlgo = c(200, 100),
+                              epsilonInAlgo = c(NA, 1e-04),
+                              initMethod = "SEMMax",
+                              nbTry = 2))
+
+res_geyser_mclust <- Mclust(scale(geyser),
+                                 G=2:4,
+                                initialization = list(hcPairs = hc("VVV", 
+                                                                   data = scale(Crabs[,-1]))))
+
+res_geyser_mixture <- gpcm(data=scale(geyser),
+                          G=2:4, start = 2)
+
+res_geyser_varselcluster <- VarSelCluster(x = scale(geyser),
+                                        gvals = 2:4,
+                                        vbleSelec = TRUE)
+
+res_geyser_clustvarsel <- clustvarsel(
+        scale(geyser),
+        G = 2:4,
+        search = "greedy",
+        direction = "forward",
+        allow.EEE = TRUE,
+        forcetwo = FALSE,
+        parallel = FALSE
+      )
+
+res_geyser_vscc <- vscc(scale(Crabs[,-1]), G=2:4)
+      
+ari_geyser_clustvarsel <- adjustedRandIndex(res_geyser_clustvarsel$model$classification, as.numeric(Crabs[,1]))
+ari_geyser_selvar <- adjustedRandIndex(res_geyser_selvar$partition, as.numeric(Crabs[,1]))
+ari_geyser_varselcluster <- adjustedRandIndex(res_geyser_varselcluster@partitions@zMAP, as.numeric(Crabs[,1]))
+ari_geyser_vscc <- adjustedRandIndex(res_geyser_vscc$bestmodel$classification, as.numeric(Crabs[,1]))
+ari_geyser_mclust <- adjustedRandIndex(res_geyser_mclust$classification, as.numeric(Crabs[,1]))
+ari_geyser_mixture <- adjustedRandIndex(res_geyser_mixture$best_model$map, as.numeric(Crabs[,1]))
+ari_geyser_mixmod <- adjustedRandIndex(res_geyser_mixmod@bestResult@partition, 
+                                      as.numeric(Crabs[,1]))
+
+ari_crabs_list <- c(ari_crabs_selvar, 
+              ari_crabs_mixture, ari_crabs_clustvarsel, 
+              ari_crabs_varselcluster, ari_crabs_vscc, 
+              ari_crabs_mclust, ari_crabs_mixmod)
+ari_crabs_list
+
+
+```
+
+
+```{r}
+source("D:\\RProject\\SelvarMix_1.2.1\\SelvarMix\\R\\VariableSelection.R")
+rank_var <- SortvarClust(x = scale(Crabs[,-1]),
+    nbcluster = 4)
+supervised <- FALSE 
+knownlabels <- as.integer(1:nrow(Crabs))
+
+VariableSelectRes <- VariableSelection(
+  scale(Crabs[,-1]), 4, "EEE", "BIC", rank_var, 
+  2, supervised, knownlabels, 2
+)
+
+
+res_varsel <- VariableSelection()
+```
+
+## Experiment
+### GPMMCM
+```{r}
+generate_missing_values <- function(Data, na.rate) {
+  if(na.rate == 0) {
+    return(list(Data = Data))
+  }
+  
+  n <- nrow(Data)
+  p <- ncol(Data)
+  
+  # Ensure each row has at least one observed value
+  keep_part <- sample(p, n, replace = TRUE) + p * 0:(n-1)
+  
+  # Calculate number of missing values
+  num_na <- floor(n * p * na.rate)
+  
+  # Generate positions for missing values
+  na_positions <- tabulate(sample((1:(n*p))[-keep_part], num_na), nbins = n*p)
+  na_positions <- matrix(na_positions, ncol = p, byrow = TRUE)
+  
+  # Set values to NA
+  Data[na_positions == 1] <- NA
+  
+  return(list(Data = Data))
+}
+
+calculate_performance <- function(pred_cluster, true_cluster) {
+  ARI <- adjustedRandIndex(true_cluster, pred_cluster)
+  CCR <- 1 - classError(true_cluster, pred_cluster)$errorRate
+  return(c(ARI = ARI, CCR = CCR))
+}
+
+evaluate_method <- function(method_fn, method_name, true_cluster, ...) {
+  tic(method_name)
+  tryCatch({
+    result <- method_fn(...)
+    elapsed <- toc(quiet = TRUE)
+    
+    if ("cluster" %in% names(result)) {
+      clusters <- result$cluster
+    } else if ("group" %in% names(result$res)) {
+      clusters <- result$res$group
+    } else {
+      clusters <- result
+    }
+    
+    perf <- calculate_performance(clusters, true_cluster)
+    c(perf, Time = as.numeric(elapsed$toc - elapsed$tic), Success = TRUE)
+  }, error = function(e) {
+    toc(quiet = TRUE)
+    message(paste("Error in method", method_name, ":", e$message))
+    c(ARI = NA, CCR = NA, Time = NA, Success = FALSE)
+  })
+}
+
+# ==== Function to run a single experiment ====
+run_single_experiment <- function(seed, na_rate = 0.1) {
+  set.seed(seed)
+  
+  # Load Hawks dataset
+  data("Hawks")
+  
+  # Extract features and true clusters
+  Y_full <- as.matrix(Hawks[, 10:14])
+  true_clus <- as.numeric(Hawks[, 7])
+  p <- ncol(Y_full)
+  n <- nrow(Y_full)
+  g <- length(unique(true_clus))
+  
+  # Generate missing values
+  missing_data <- generate_missing_values(Y_full, na_rate)
+  Y_missing <- missing_data$Data
+  
+  # Create kNN imputed data for initialization
+  Y_knn <- kNN(Y_missing, k = 5)[, 1:p]
+
+  # ==== Run GPMMCM Models ====
+  gpmmcm_models <- c("EEI")
+  
+  gpmmcm_results <- lapply(gpmmcm_models, function(model) {
+    tryCatch({
+      run_gpmmcm(model, Y_missing, Y_knn, g, true_clus)$model.inf[c("ARI", "CCR", "Time")]
+    }, error = function(e) {
+      message(paste("Error in GPMMCM model", model, ":", e$message))
+      c(ARI = NA, CCR = NA, Time = NA)
+    })
+  })
+  names(gpmmcm_results) <- gpmmcm_models
+  
+  # ==== Run Alternative Methods ====
+  all_results <- list()
+  all_results <- c(all_results, gpmmcm_results)
+  
+  # Evaluate alternative methods
+  all_results$Amelia <- evaluate_method(run_amelia, "Amelia", true_clus, Y_missing, g)
+  all_results$MICE <- evaluate_method(run_mice, "MICE", true_clus, Y_missing, g)
+  all_results$MI <- evaluate_method(run_mi, "MI", true_clus, Y_missing, g)
+  all_results$kPOD <- evaluate_method(run_kpod, "kPOD", true_clus, Y_missing, g)
+  
+  # Evaluate FM models
+  all_results$FM_MNC <- evaluate_method(run_fmmnc, "FM-MNC", true_clus, Y_missing, Y_knn, g, true_clus)
+  all_results$FM_MSNC <- evaluate_method(run_fmmsnc, "FM-MSNC", true_clus, Y_missing, Y_knn, g, true_clus)
+  
+  # Evaluate SelvarClustLasso
+  g_range <- max(2, g-1):min(g+1, 5)  # Range around true number of clusters
+  selvarclust_models <- "mixmodGaussianModel(family=\"all\")"
+  selvarclust_rmodels <- c("LB", "LI", "LC")
+  
+  tryCatch({
+    tic("SelvarClustLasso")
+    selvarclust_result <- run_selvarclustlasso(Y_missing, g_range, selvarclust_models, selvarclust_rmodels)
+    selvarclust_time <- toc(quiet = TRUE)
+    
+    # Extract best model and compute performance
+    best_model <- selvarclust_result$best_model
+    selvarclust_clusters <- best_model$classification
+    selvarclust_perf <- calculate_performance(selvarclust_clusters, true_clus)
+    
+    all_results$SelvarClustLasso <- c(
+      selvarclust_perf,
+      Time = as.numeric(selvarclust_time$toc - selvarclust_time$tic),
+      Success = TRUE
+    )
+  }, error = function(e) {
+    message(paste("Error in SelvarClustLasso:", e$message))
+    all_results$SelvarClustLasso <- c(ARI = NA, CCR = NA, Time = NA, Success = FALSE)
+  })
+  
+  # Convert results to a data frame
+  results_df <- do.call(rbind, all_results)
+  
+  # Add method names and experiment ID
+  results_df <- as.data.frame(results_df)
+  results_df$Method <- rownames(results_df)
+  results_df$Experiment <- seed
+  
+  return(results_df)
+}
+
+# ==== Run multiple experiments ====
+run_multiple_experiments <- function(n_runs = 10, na_rate = 0.1) {
+  # Create a list to store results from each run
+  all_runs <- list()
+  
+  # Run the experiment n times
+  for (i in 1:n_runs) {
+    cat(sprintf("Running experiment %d of %d...\n", i, n_runs))
+    result <- run_single_experiment(seed = i, na_rate = na_rate)
+    all_runs[[i]] <- result
+  }
+  
+  # Combine results from all runs
+  combined_results <- do.call(rbind, all_runs)
+  
+  return(combined_results)
+}
+
+# ==== Compute statistics and create plots ====
+analyze_results <- function(combined_results) {
+  # Calculate summary statistics (mean, sd) for each method
+  summary_stats <- combined_results %>%
+    group_by(Method) %>%
+    summarize(
+      Mean_ARI = mean(ARI, na.rm = TRUE),
+      SD_ARI = sd(ARI, na.rm = TRUE),
+      Mean_CCR = mean(CCR, na.rm = TRUE),
+      SD_CCR = sd(CCR, na.rm = TRUE),
+      Mean_Time = mean(Time, na.rm = TRUE),
+      SD_Time = sd(Time, na.rm = TRUE),
+      Success_Rate = sum(Success, na.rm = TRUE) / n()
+    )
+  
+  performance_long <- combined_results %>%
+    select(Method, Experiment, ARI, CCR) %>%
+    pivot_longer(cols = c("ARI", "CCR"), 
+                 names_to = "Metric", 
+                 values_to = "Value")
+
+  perf_plot <- ggplot(performance_long, aes(x = reorder(Method, Value, FUN = median, na.rm = TRUE), 
+                                           y = Value, fill = Metric)) +
+    geom_boxplot() +
+    facet_wrap(~ Metric, scales = "free_y") +
+    coord_flip() +
+    labs(title = "Clustering Performance Metrics",
+         x = "Method", y = "Value") +
+    theme_minimal() +
+    scale_fill_brewer(palette = "Set1")
+  
+  # Create time boxplot
+  time_plot <- ggplot(combined_results, 
+                     aes(x = reorder(Method, Time, FUN = median, na.rm = TRUE), y = Time)) +
+    geom_boxplot(fill = "steelblue") +
+    coord_flip() +
+    labs(title = "Computation Time",
+         x = "Method", y = "Time (seconds)") +
+    theme_minimal()
+  
+  # Return results
+  return(list(
+    summary_stats = summary_stats,
+    performance_plot = perf_plot,
+    time_plot = time_plot,
+    raw_results = combined_results
+  ))
+}
+
+# GPMMCM 
+run_gpmmcm <- function(model_type, Y_data, Y_init, g, true_cluster) {
+  model_fn <- paste0(model_type, ".GMIXCMB.ECM.new")
+  
+  result <- do.call(model_fn, list(
+    Y_data, Y_init, matrix(0, nrow(Y_data), ncol(Y_data)),
+    g = g, true.clus = true_cluster, tol = 1e-5,
+    neq.S = TRUE, max.iter = 500, per = 20
+  ))
+  
+  return(result)
+}
+
+# Amelia (multiple imputation)
+run_amelia <- function(Y_data, g) {
+  a_out <- amelia(x = Y_data)
+  X_imputed <- matrix(0, nrow(Y_data), ncol(Y_data))
+  
+  # Average imputed datasets
+  for (j in 1:a_out$m) {
+    X_imputed <- X_imputed + a_out$imputations[[j]] / a_out$m
+  }
+  
+  # Cluster using k-means
+  kmeans_result <- kmeans(as.matrix(X_imputed), g)
+  return(kmeans_result)
+}
+
+# MICE (Multiple Imputation by Chained Equations)
+run_mice <- function(Y_data, g) {
+  mice_out <- mice(Y_data)
+  X_imputed <- mice_out$data
+  
+  # Extract imputed values
+  for (j in 1:ncol(Y_data)) {
+    imp_rows <- as.numeric(lapply(mice_out$imp, row.names)[[j]])
+    imp_vals <- lapply(mice_out$imp, rowMeans)[[j]]
+    X_imputed[imp_rows, j] <- imp_vals
+  }
+  
+  # Cluster using k-means
+  kmeans_result <- kmeans(as.matrix(X_imputed), g)
+  return(kmeans_result)
+}
+
+# MI (Multiple Imputation)
+run_mi <- function(Y_data, g) {
+  mi_data <- missing_data.frame(Y_data)
+  # Specify no transformation for variables
+  mi_data <- change(mi_data, y = colnames(Y_data), what = "transformation", to = "identity")
+  
+  # Run imputation
+  imputations <- mi(mi_data)
+  
+  # Average results from chains
+  chain1 <- imputations@data$chain1@X[, 2:(ncol(Y_data)+1)]
+  chain2 <- imputations@data$chain2@X[, 2:(ncol(Y_data)+1)]
+  chain3 <- imputations@data$chain3@X[, 2:(ncol(Y_data)+1)]
+  chain4 <- imputations@data$chain4@X[, 2:(ncol(Y_data)+1)]
+  X_imputed <- (chain1 + chain2 + chain3 + chain4) / 4
+  
+  # Cluster using k-means
+  kmeans_result <- kmeans(as.matrix(X_imputed), g)
+  return(kmeans_result)
+}
+
+# kPOD (k-POD clustering with missing data)
+run_kpod <- function(Y_data, g) {
+  kpod_result <- kpod(as.matrix(Y_data), g)
+  return(kpod_result)
+}
+
+# FM-MNC and FM-MSNC models
+run_fmmnc <- function(Y_data, Y_init, g, true_cluster, family) {
+  # Initialize cluster assignments
+  clus <- kmeans(Y_init, g)$cluster
+  
+  # Initialize parameters
+  mu <- Sigma <- shape <- list()
+  pii <- numeric(g)
+  
+  for (i in 1:g) {
+    pii[i] <- sum(clus == i) / length(clus)
+    mu[[i]] <- colMeans(Y_init[clus == i, ], na.rm = TRUE)
+    Sigma[[i]] <- var(Y_init, na.rm = TRUE)
+    shape[[i]] <- rep(0.1, g)
+  }
+  
+  # Set up censoring indicators for missing values (all set to right-censored)
+  cc <- matrix(0, nrow(Y_data), ncol(Y_data))
+  cc[is.na(Y_data)] <- 1
+  
+  # Lower and upper bounds
+  LI <- matrix(-Inf, nrow(Y_data), ncol(Y_data))
+  LS <- matrix(Inf, nrow(Y_data), ncol(Y_data))
+  
+  # Simulate FM-MNC result
+  if (family=="normal"){
+  result <- fit.FMMSNC(cc, LI, LS, Y_data, mu = mu,
+                      Sigma = Sigma, shape = shape, pii = pii, g = g,
+                      get.init = FALSE, criteria = TRUE, family = "Normal",
+                      error = 0.00001, iter.max = 350, uni.Gama = FALSE, cal.im = FALSE)
+  }
+  else {
+  result <- fit.FMMSNC(cc, LI, LS, Y_data, mu = mu,
+                      Sigma = Sigma, shape = shape, pii = pii, g = g,
+                      get.init = FALSE, criteria = TRUE, family = "SN",
+                      error = 0.00001, iter.max = 350, uni.Gama = FALSE, cal.im = FALSE)
+  }
+  return(result)
+}
+
+# SelvarClustLasso method
+run_selvarclustlasso <- function(Y_data, g_range, models, rmodels) {
+  result <- SelvarClustLasso(
+    x = scale(Y_data), 
+    nbcluster = g_range,
+    models = models,
+    rmodel = rmodels,
+    hsize = 2,
+    nbcores = min(6, parallel::detectCores()),
+    impute_missing = TRUE, 
+    scale_data = TRUE
+  )
+  return(result)
+}
+
+  
+# ==== Run the experiment ====
+# n_runs <- 10
+# na_rate <- 0.1
+# 
+# 
+# results <- run_multiple_experiments(n_runs, na_rate)
+# 
+# 
+# analysis <- analyze_results(results)
+# 
+# 
+# print(analysis$summary_stats)
+# 
+# 
+# write.csv(analysis$summary_stats, "exp_10_0.1_hawks_summary.csv", row.names = FALSE)
+# write.csv(analysis$raw_results, "exp_10_0.1_hawks_full.csv", row.names = FALSE)
+
+```
+
+### Hawks dataset
+```{r}
+set.seed(123)
+
+data("Hawks")
+na_rate <- 0.2
+# Extract features and true clusters
+Y_full <- as.matrix(Hawks[, 10:14])
+true_clus <- as.numeric(Hawks[, 7])
+p <- ncol(Y_full)
+n <- nrow(Y_full)
+g <- length(unique(true_clus))
+
+# Generate missing values
+missing_data <- generate_missing_values(Y_full, na_rate)
+Y_missing <- missing_data$Data
+
+# Create kNN imputed data for initialization
+Y_knn <- kNN(Y_missing, k = 5)[, 1:p]
+
+# ==== Run GPMMCM Models ====
+# gpmmcm_models <- c("EEI")
+gpmmcm_models <- c("VVV", "EEE", "EEV", "EVE", "EVV", "VEE", "VEV", 
+                   "VVE", "VEI", "EEI", "VVI", "EVI", "VII", "EII")
+gpmmcm_results <- lapply(gpmmcm_models, function(model) {
+  tryCatch({
+    run_gpmmcm(model, Y_missing, Y_knn, g, true_clus)$model.inf[c("ARI", "CCR", "Time")]
+  }, error = function(e) {
+    message(paste("Error in GPMMCM model", model, ":", e$message))
+    c(ARI = NA, CCR = NA, Time = NA)
+  })
+})
+names(gpmmcm_results) <- gpmmcm_models
+ari_values <- c()
+ccr_values <- c()
+model_names <- c()
+for (model in gpmmcm_models) {
+  if (!is.na(gpmmcm_results[[model]][1])) {
+    ari_values <- c(ari_values, gpmmcm_results[[model]][1])
+    ccr_values <- c(ccr_values, gpmmcm_results[[model]][2])
+    model_names <- c(model_names, model)
+  }
+}
+max_id_ari <- which.max(ari_values)
+max_id_ccr <- which.max(ccr_values)
+max_ari <- ari_values[max_id_ari]
+max_ccr <- ccr_values[max_id_ccr]
+best_model <- model_names[max_id_ari]
+
+# === Run FM-MNC ====
+run_fmmnc <- function(Y_data, Y_init, g, true_cluster, family = "normal") {
+  clus <- kmeans(Y_init, g)$cluster
+  
+  mu <- Sigma <- shape <- list()
+  pii <- numeric(g)
+  
+  for (i in 1:g) {
+    pii[i] <- sum(clus == i) / length(clus)
+    mu[[i]] <- colMeans(Y_init[clus == i, ], na.rm = TRUE)
+    Sigma[[i]] <- var(Y_init[clus == i, ], na.rm = TRUE)
+    shape[[i]] <- rep(0.1, ncol(Y_data))  
+  }
+  
+  cc <- matrix(0, nrow(Y_data), ncol(Y_data))
+  cc[is.na(Y_data)] <- 1
+  
+  # Lower and upper bounds
+  LI <- matrix(-Inf, nrow(Y_data), ncol(Y_data))
+  LS <- matrix(Inf, nrow(Y_data), ncol(Y_data))
+  
+  start_time <- Sys.time()
+  
+  # Run FM-MNC/FM-MNSC
+  if (family == "normal") {
+    result <- fit.FMMSNC(cc, LI, LS, Y_data, mu = mu,
+                       Sigma = Sigma, shape = shape, pii = pii, g = g,
+                       get.init = FALSE, criteria = TRUE, family = "Normal",
+                       error = 0.00001, iter.max = 350, uni.Gama = FALSE, cal.im = FALSE)
+  } else {
+    result <- fit.FMMSNC(cc, LI, LS, Y_data, mu = mu,
+                       Sigma = Sigma, shape = shape, pii = pii, g = g,
+                       get.init = FALSE, criteria = TRUE, family = "SN",
+                       error = 0.00001, iter.max = 350, uni.Gama = FALSE, cal.im = FALSE)
+  }
+  
+  end_time <- Sys.time()
+  execution_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  return(result)
+  
+  # perf <- calculate_performance(result$res$group, true_cluster)
+  # 
+  # return(list(
+  #   model = result,
+  #   performance = c(ARI = perf$ARI, CCR = perf$CCR, Time = execution_time)
+  # ))
+}
+
+# FM-MNC (Normal mixture)
+fmmnc_result <- tryCatch({
+  run_fmmnc(Y_missing, Y_knn, g, true_clus, family = "normal")
+}, error = function(e) {
+  message(paste("Error in FM-MNC model:", e$message))
+  list(performance = c(ARI = NA, CCR = NA, Time = NA))
+})
+
+# FM-MNSC (Skew Normal mixture)
+fmmnsc_result <- tryCatch({
+  run_fmmnc(Y_missing, Y_knn, g, true_clus, family = "SN")
+}, error = function(e) {
+  message(paste("Error in FM-MNSC model:", e$message))
+  list(performance = c(ARI = NA, CCR = NA, Time = NA))
+})
+
+fmmnc_result$performance <- calculate_performance(fmmnc_result$res$group, true_clus)
+fmmnsc_result$performance <- calculate_performance(fmmnsc_result$res$group, true_clus)
+
+perf_hawks_fmmnc <- c(fmmnc_result$performance["ARI"], fmmnc_result$performance["CCR"])
+perf_hawks_fmmnsc <- c(fmmnsc_result$performance["ARI"], fmmnsc_result$performance["CCR"])
+
+
+
+# ==== Run Clustvarsel Models ====
+imputed_data <- missRanger(as.data.frame(missing_data))
+res_hawks_clustvarsel <- clustvarsel(
+        scale(as.matrix(imputed_data)),
+        G = 2:4,
+        search = "greedy",
+        direction = "backward",
+        allow.EEE = TRUE,
+        forcetwo = FALSE,
+        parallel = FALSE  
+      )
+
+# ==== Run SelvarClustLasso Models ====
+res_hawks_selvar <- run_selvarclustlasso(scale(Y_missing), 2, 
+                                         "mixmodGaussianModel(family=\"diagonal\")",
+                                         # "VVI",
+                                         # "gaussian_pk_sjk",
+                                         c("LB", "LI", "LC"))
+
+# ==== Compare models ====
+perf_hawks_clustvarsel<- calculate_performance(res_hawks_clustvarsel$model$classification, true_clus)
+perf_hawks_selvar <- calculate_performance(res_hawks_selvar$partition, true_clus)
+
+perf_hawks_gpmmcm <- c(max_ari, max_ccr)
+
+metrics_hawks <- data.frame(
+  Model = c("gpmmcm", "FM-MNC", "Selvar","Clustvarsel"),
+  CCR = c(perf_hawks_gpmmcm[2], perf_hawks_fmmnc[2], 
+          perf_hawks_selvar[2], perf_hawks_clustvarsel[2]),
+  ARI = c(perf_hawks_gpmmcm[1], perf_hawks_fmmnc[1], 
+          perf_hawks_selvar[1], perf_hawks_clustvarsel[1]))
+
+# load("result/exp_gpmmcm_selvar.RData")
+# save.image("exp_gpmmcm_selvar.RData")
+# save(metrics_hawks, file="exp_gpmmcm_selvar.RData")
+
+load("result/exp_gpmmcm_selvar.RData")
+metrics_hawks
+```
+
+### DMS dataset
+```{r}
+data <- read.csv("DMSdata.csv")
+true_clus <- as.numeric(factor(data[, 1]))
+Ycm <- as.matrix(data[, -1])
+p <- ncol(Ycm)
+n <- nrow(Ycm)
+
+cen <- matrix(0, n, p)
+cen[is.na(Ycm[, 1]), 1] <- NA
+cen[, 2] <- (Ycm[, 2] == 2) * 1
+cen[, 3] <- (Ycm[, 3] == 4) * 1
+cen[, 4] <- (Ycm[, 4] == 11.3) * 1
+cen[, 5] <- (Ycm[, 5] == 0.22) * 1
+
+set.seed(7)
+Y_knn <- kNN(Ycm, k = 5)[, 1:p]
+g <- 2
+# --------------------------------------------------
+# Fit GPMMCM Models
+# --------------------------------------------------
+cat("Fitting GPMMCM models...\n")
+
+# -------------------
+# Run GPMMCM Models
+# -------------------
+
+# Define the function to run a single GPMMCM model
+run_gpmmcm <- function(model_type, Y, Y_knn, cen, g, true_clus) {
+  start_time <- Sys.time()
+  
+  # Common parameters for all models
+  common_args <- list(
+    Y = Y, 
+    Y.knn = Y_knn,
+    cen = cen,
+    g = g, 
+    true.clus = true_clus,
+    tol = 1e-6, 
+    neq.S = TRUE, 
+    max.iter = 500, 
+    per = 20
+  )
+  if (model_type %in% c("EVE", "VVE")) {
+    common_args$tol.FG <- 1e-3
+    common_args$max.iter.FG <- 10
+  }
+  
+  func_name <- paste0(model_type, ".GMIXCMB.ECM.new")
+  
+  result <- do.call(func_name, common_args)
+  
+  end_time <- Sys.time()
+  result$model.inf["Time"] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  return(result)
+}
+
+gpmmcm_models <- c("VVV", "EEE", "EEV", "EVE", "EVV", "VEE", "VEV", 
+                   "VVE", "VEI", "EEI", "VVI", "EVI", "VII", "EII")
+
+gpmmcm_results <- data.frame(
+  Model = character(),
+  loglik = numeric(),
+  BIC = numeric(),
+  ARI = numeric(),
+  CCR = numeric(),
+  npar = numeric(),
+  Time = numeric(),
+  stringsAsFactors = FALSE
+)
+
+cat("Running GPMMCM models:\n")
+for (model in gpmmcm_models) {
+  cat(paste0("  - Processing model: ", model, "... "))
+  
+  result <- tryCatch({
+    run_gpmmcm(model, Ycm, Y_knn, cen, g, true_clus)
+  }, error = function(e) {
+    cat("ERROR\n")
+    message(paste("    Error in GPMMCM model", model, ":", e$message))
+    return(NULL)
+  })
+  
+  if (!is.null(result)) {
+    model_row <- data.frame(
+      Model = model,
+      loglik = result$model.inf["loglik"],
+      BIC = result$model.inf["BIC"],
+      ARI = result$model.inf["ARI"],
+      CCR = result$model.inf["CCR"],
+      Time = result$model.inf["Time"],
+      stringsAsFactors = FALSE
+    )
+    
+    gpmmcm_results <- rbind(gpmmcm_results, model_row)
+    cat(sprintf("DONE (ARI=%.3f, CCR=%.3f, Time=%.2fs)\n", 
+                result$model.inf["ARI"], 
+                result$model.inf["CCR"], 
+                result$model.inf["Time"]))
+  }
+
+gpmmcm_results <- gpmmcm_results[order(-gpmmcm_results$ARI), ]
+
+
+# --------------------------------------------------
+# Initialize parameters for FM-MNC model
+# --------------------------------------------------
+cat("Initializing parameters for FM-MNC model...\n")
+
+if (g == 1) {
+  clus <- rep(1, n)
+} else {
+  clus <- kmeans(Y_knn, g)$cluster
+}
+
+mu <- Sigma <- shape <- list()
+pii <- numeric(g)
+
+for (i in 1:g) {
+  pii[i] <- sum(clus == i) / n
+  mu[[i]] <- colMeans(Y_knn[clus == i, ], na.rm = TRUE)
+  Sigma[[i]] <- var(Y_knn, na.rm = TRUE)
+  shape[[i]] <- rnorm(p)
+}
+
+# Setup for missing values only
+cc <- matrix(0, n, p)
+cc[is.na(Ycm)] <- 1 
+# --------------------------------------------------
+# Fit FM-MNC model
+# --------------------------------------------------
+cat("Fitting FM-MNC model...\n")
+start_time_mnc <- Sys.time()
+fit.mnc <- fit.FMMSNC(
+  cc, 
+  LI = matrix(-Inf, n, p),
+  LS = matrix(Inf, n, p),   
+  Ycm, 
+  mu = mu, Sigma = Sigma, shape = shape, pii = pii, 
+  g = g, get.init = FALSE, criteria = TRUE, 
+  family = "Normal", error = 0.00001, iter.max = 350, 
+  uni.Gama = FALSE, cal.im = FALSE
+)
+fit.mnc.CCR <- 1 - classError(true_clus, fit.mnc$res$group)$errorRate
+fit.mnc.ARI <- adjustedRandIndex(true_clus, fit.mnc$res$group)
+end_time_mnc <- Sys.time()
+cat(sprintf("FM-MNC running time: %.2f seconds, CCR: %.3f, ARI: %.3f\n", 
+            difftime(end_time_mnc, start_time_mnc, units = "secs"),
+            fit.mnc.CCR, fit.mnc.ARI))
+
+
+# --------------------------------------------------
+# Fit SelvarClustLasso model
+# --------------------------------------------------
+cat("Fitting SelvarClustLasso models...\n")
+Y_data <- Ycm
+
+g_range <- 2:4
+models <- "mixmodGaussianModel(family=\"general\",
+                                equal.proportions=FALSE)"
+
+# models <- "VVV"                                         
+rmodels <- c("LB", "LI", "LC")
+
+start_time_scl <- Sys.time()
+scl_results <- run_selvarclustlasso(
+  Y_data = Y_data, 
+  g_range = g_range, 
+  models = models, 
+  rmodels = rmodels)
+end_time_scl <- Sys.time()
+
+scl_clusters <- scl_results$partition
+scl_performance <- calculate_performance(scl_clusters, true_clus)
+
+cat(sprintf("SelvarClustLasso running time: %.2f seconds, CCR: %.3f, ARI: %.3f\n", 
+            difftime(end_time_scl, start_time_scl, units = "secs"),
+            scl_performance["CCR"], scl_performance["ARI"]))
+
+metrics_dms <- data.frame(
+  Model = c("gpmmcm", "FM-MNC", "Selvar"),
+  CCR = c(gpmmcm_results[1, "CCR"], fit.mnc.CCR, scl_performance["CCR"]),
+  ARI = c(gpmmcm_results[1, "ARI"], fit.mnc.ARI, scl_performance["ARI"])
+)
+
+#    Model       CCR       ARI
+# 1 gpmmcm 0.8403361 0.4546822
+# 2 FM-MNC 0.8991597 0.6339280
+# 3 Selvar 0.8655462 0.5301506
+
+metrics_dms
+```
+
+
+### Mixmod vs Mixall
+```{r, warning=F}
+miss_rate <- 0.1
+miss_pattern <- "MAR"
+model_names <- if (miss_pattern == "MNAR"){c("SelvarMixall", "SelvarMixmod",
+                 "SelvarMNARzMixall", "SelvarMNARzMixmod")} else {c("SelvarMixmod", "MGMM")}
+data_maugis_2012 <- simulate_Maugis_data2019()
+data_missing <- produce_NA(data_maugis_2012$data, 
+                          mechanism = miss_pattern, 
+                          perc.missing = miss_rate)$data.incomp
+true_data <- data_maugis_2012$data
+true_labels <- data_maugis_2012$class
+results <- list()
+# Run models and compute metrics
+for (model in model_names) {
+  cat("Running model:", model, "\n")
+  
+  if (model == "SelvarMixall") {
+    model_result <- SelvarClustLasso(
+      x = data_missing,
+      nbcluster = 4,
+      models = "gaussian_pk_sjk",
+      rmodel = c("LB", "LI"),
+      hsize = 2,
+      nbcores = min(6, detectCores()),
+      impute_missing = (miss_rate > 0),
+      scale_data = TRUE,
+      use_missing_pattern = FALSE
+    )
+  }
+  else if (model == "SelvarMixmod") {
+    model_result <- SelvarClustLasso(
+      x = data_missing,
+      nbcluster = 4,
+      models = "mixmodGaussianModel(family=\"diagonal\")",
+      rmodel = c("LB", "LI"),
+      hsize = 2,
+      nbcores = min(6, detectCores()),
+      impute_missing = (miss_rate > 0),
+      scale_data = TRUE,
+      use_missing_pattern = FALSE
+    )
+  }
+  else if (model == "MGMM") {
+    model_result <- FitGMM(as.matrix(data_missing), k=4, report = FALSE)
+  }
+  else if (model == "SelvarMNARzMixall") {
+    model_result <- SelvarClustLasso(
+      x = data_missing,
+      nbcluster = 4,
+      models = "gaussian_pk_sjk",
+      rmodel = c("LB", "LI"),
+      hsize = 2,
+      nbcores = min(6, detectCores()),
+      impute_missing = (miss_rate > 0),
+      scale_data = TRUE,
+      use_missing_pattern = TRUE,
+      true_labels = data_maugis_2012$class
+    )
+  }
+  else if (model == "SelvarMNARzMixmod") {
+    model_result <- SelvarClustLasso(
+      x = data_missing,
+      nbcluster = 4,
+      models = "mixmodGaussianModel(family=\"all\")",
+      rmodel = c("LB", "LI"),
+      hsize = 2,
+      nbcores = min(6, detectCores()),
+      impute_missing = (miss_rate > 0),
+      scale_data = TRUE,
+      use_missing_pattern = TRUE,
+      true_labels = data_maugis_2012$class
+    )
+  }
+  
+  # Store model results - handle MGMM differently
+  if (model == "MGMM"){
+    imputed_data <- model_result@Completed
+    predicted_labels <- model_result@Assignments[,1]
+  }
+  else{
+    imputed_data <- model_result$imputedData
+    predicted_labels <- model_result$partition
+    relevant_vars <- model_result$S
+    bic <- model_result$criterionValue
+    n_clusters <- model_result$nbcluster
+  }
+  
+  # Compute metrics
+  ari <- adjustedRandIndex(true_labels, predicted_labels)
+  nrmse <- compute_nrmse(true_data, imputed_data, data_missing)
+  w_nrmse <- compute_weighted_nrmse(true_data, data_missing, imputed_data, true_labels)
+  ciie <- compute_ciie(true_data, data_missing, imputed_data, true_labels, predicted_labels)
+  
+  # Store results - different structure for MGMM
+  if (model == "MGMM") {
+    results[[model]] <- list(
+      imputed_data = imputed_data,
+      predicted_labels = predicted_labels,
+      metrics = list(
+        ARI = ari,
+        NRMSE = nrmse,
+        W_NRMSE = w_nrmse,
+        CIIE = ciie
+      )
+    )
+  } else {
+    results[[model]] <- list(
+      imputed_data = imputed_data,
+      predicted_labels = predicted_labels,
+      relevant_vars = relevant_vars,
+      bic = bic,
+      n_clusters = n_clusters,
+      metrics = list(
+        ARI = ari,
+        NRMSE = nrmse,
+        W_NRMSE = w_nrmse,
+        CIIE = ciie
+      )
+    )
+  }
+}
+
+# Create metrics table with NA values for MGMM's BIC and SelectedVars
+metrics_table <- data.frame(
+  Model = character(),
+  ARI = numeric(),
+  NRMSE = numeric(),
+  W_NRMSE = numeric(),
+  CIIE = numeric(),
+  BIC = numeric(),
+  SelectedVars = character(),
+  stringsAsFactors = FALSE
+)
+
+for (model in model_names) {
+  if (model == "MGMM") {
+    metrics_table <- rbind(metrics_table, data.frame(
+      Model = model,
+      ARI = results[[model]]$metrics$ARI,
+      NRMSE = results[[model]]$metrics$NRMSE,
+      W_NRMSE = results[[model]]$metrics$W_NRMSE,
+      CIIE = results[[model]]$metrics$CIIE,
+      BIC = NA,
+      SelectedVars = NA,
+      stringsAsFactors = FALSE
+    ))
+  } else {
+    metrics_table <- rbind(metrics_table, data.frame(
+      Model = model,
+      ARI = results[[model]]$metrics$ARI,
+      NRMSE = results[[model]]$metrics$NRMSE,
+      W_NRMSE = results[[model]]$metrics$W_NRMSE,
+      CIIE = results[[model]]$metrics$CIIE,
+      BIC = results[[model]]$bic,
+      SelectedVars = paste(results[[model]]$relevant_vars, collapse = ", "),
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+print(metrics_table)
+
+```
+
+## Test new missing values treatment methods
+```{r}
+mmcem <- function(X, G, modelName, 
+                  method = c("MMCEM1", "MMCEM2"), 
+                  S = 10, maxit = 100, warmup = 20, 
+                  tol = 1e-4, K = 5, init.params = NULL,
+                  epsilon = 1e-6) {
+  method <- match.arg(method)
+  X <- as.matrix(X)
+  colnames(X) <- NULL
+  n <- nrow(X)
+  d <- ncol(X)
+  
+  # Dimension validation
+  if (n < G) stop("More clusters than observations")
+  if (d < 1) stop("Invalid dimension")
+  
+  # Initialization
+  if (is.null(init.params)) {
+    complete_idx <- complete.cases(X)
+    if (sum(complete_idx) < G) stop("Insufficient complete cases")
+    
+    init_fit <- Mclust(X[complete_idx,], G = G, modelNames = modelName, verbose = FALSE)
+    if (is.null(init_fit)) stop("Mclust initialization failed")
+    
+    params <- list(
+      pro = init_fit$parameters$pro,
+      mean = matrix(init_fit$parameters$mean, nrow = d, ncol = G),
+      variance = list(sigma = array(init_fit$parameters$variance$sigma, dim = c(d, d, G)))
+    )
+  } else {
+    params <- init.params
+  }
+  
+  best_params <- params
+  best_loglik <- -Inf
+  best_imputed_data <- NULL
+  loglik_history <- numeric(maxit)
+  converged <- FALSE
+  stalled <- 0
+  
+  for (iter in 1:maxit) {
+    processed_params <- list(
+      pro = params$pro,
+      mean = matrix(params$mean, nrow = d, ncol = G),
+      variance = list(sigma = array(params$variance$sigma, dim = c(d, d, G)))
+    )
+    
+    # E-step
+    # estep <- 
+    #   if (method == "MMCEM1") {
+    #     .mmcem1_estep(X, processed_params, S, epsilon)
+    #   } else {
+    #     .mmcem2_estep(X, processed_params, S, epsilon)
+    #   }
+    
+    estep <- tryCatch({
+      if (method == "MMCEM1") {
+        .mmcem1_estep(X, processed_params, S, epsilon)
+      } else {
+        .mmcem2_estep(X, processed_params, S, epsilon)
+      }
+    }, error = function(e) {
+      warning("E-step failed: ", e$message)
+      return(NULL)
+    })
+
+    if (is.null(estep)) next
+    
+    # M-step
+    mstep <- tryCatch({
+      mstep(modelName, data = estep$data, z = estep$z)
+    }, error = function(e) {
+      warning("M-step failed: ", e$message)
+      return(NULL)
+    })
+    
+    if (is.null(mstep)) next
+    
+    params <- list(
+      pro = mstep$parameters$pro,
+      mean = matrix(mstep$parameters$mean, nrow = d, ncol = G),
+      variance = list(sigma = array(mstep$parameters$variance$sigma, dim = c(d, d, G)))
+    )
+    
+    # Log-likelihood
+    current_loglik <- tryCatch({
+      .compute_observed_loglik(X, params)
+    }, error = function(e) {
+      warning("Log-likelihood failed: ", e$message)
+      return(best_loglik)
+    })
+    
+    # Convergence check
+    if (current_loglik > best_loglik + tol) {
+      best_loglik <- current_loglik
+      best_params <- params
+      best_imputed_data <- estep$data
+      stalled <- 0
+    } else {
+      stalled <- stalled + 1
+    }
+    
+    if (iter > warmup && stalled >= K) {
+      converged <- TRUE
+      break
+    }
+  }
+  
+  structure(list(
+    parameters = best_params,
+    loglik = best_loglik,
+    imputedData = best_imputed_data,
+    method = method,
+    converged = converged,
+    iterations = iter
+  ), class = "mmcem")
+}
+
+.mmcem1_estep <- function(X, params, S, epsilon) {
+  n <- nrow(X)
+  d <- ncol(X)
+  G <- length(params$pro)
+  
+  augmented_data <- matrix(nrow = 0, ncol = d)
+  augmented_z <- matrix(nrow = 0, ncol = G)
+  
+  for (i in 1:n) {
+    x_i <- X[i,]
+    observed <- !is.na(x_i)
+    x_obs <- x_i[observed]
+    
+    if (sum(observed) == 0) {
+      log_probs <- log(params$pro)
+    } else {
+      log_probs <- vapply(1:G, function(g) {
+        mu_g <- params$mean[observed, g]
+        sigma_g <- matrix(params$variance$sigma[observed, observed, g], 
+                          nrow = sum(observed), ncol = sum(observed))
+        if (length(mu_g) != length(x_obs)) {
+          stop(paste("Dimension mismatch for observation", i, "cluster", g, 
+                     ": mean length", length(mu_g), "vs data length", length(x_obs)))
+        }
+        dmvnorm(x_obs, mu_g, sigma_g, log = TRUE) + log(params$pro[g])
+      }, numeric(1))
+    }
+    
+    z_i <- exp(log_probs - logSumExp(log_probs))
+    z_i <- (z_i + epsilon) / sum(z_i + epsilon)
+    
+    sampled_clusters <- sample(G, S, replace = TRUE, prob = z_i)
+    
+    for (s in sampled_clusters) {
+      x_imp <- x_i
+      if (any(!observed)) {
+        mu_cond <- .conditional_mean(x_obs, params$mean[,s], params$variance$sigma[,,s], observed)
+        sigma_cond <- .conditional_cov(params$variance$sigma[,,s], observed)
+        x_imp[!observed] <- rmvnorm(1, mu_cond, sigma_cond)
+      }
+      augmented_data <- rbind(augmented_data, x_imp)
+      augmented_z <- rbind(augmented_z, tabulate(s, G))
+    }
+  }
+  
+  list(data = augmented_data, z = augmented_z)
+}
+
+.mmcem2_estep <- function(X, params, S, epsilon) {
+  n <- nrow(X)
+  d <- ncol(X)
+  G <- length(params$pro)
+  
+  augmented_data <- matrix(nrow = 0, ncol = d)
+  augmented_z <- matrix(nrow = 0, ncol = G)
+  
+  for (i in 1:n) {
+    x_i <- X[i,]
+    observed <- !is.na(x_i)
+    x_obs <- x_i[observed]
+    
+    # Handle all-missing case
+    log_probs <- numeric(G)
+    if (sum(observed) == 0) {
+      log_probs <- log(params$pro)
+    } else {
+      log_probs <- vapply(1:G, function(g) {
+        mu_g <- params$mean[observed, g]
+        sigma_g <- params$variance$sigma[observed, observed, g]
+        if (length(mu_g) != length(x_obs)) {
+          stop(paste("Dimension mismatch for observation", i, "cluster", g, 
+                     ": mean length", length(mu_g), "vs data length", length(x_obs)))
+        }
+        dmvnorm(x_obs, mu_g, sigma_g, log = TRUE) + log(params$pro[g])
+      }, numeric(1))
+    }
+    if (length(log_probs) == 0) {
+      stop("log_probs has length zero for observation ", i)}
+    
+    z_i <- exp(log_probs - logSumExp(log_probs))
+    z_i <- (z_i + epsilon) / sum(z_i + epsilon)
+    
+    for (g in 1:G) {
+      x_imp <- matrix(x_i, nrow = S, ncol = d, byrow = TRUE)
+      if (any(!observed)) {
+        mu_cond <- .conditional_mean(x_obs, params$mean[,g], params$variance$sigma[,,g], observed)
+        sigma_cond <- .conditional_cov(params$variance$sigma[,,g], observed)
+        x_imp[, !observed] <- rmvnorm(S, mu_cond, sigma_cond)
+      }
+      augmented_data <- rbind(augmented_data, x_imp)
+      z_block <- matrix(0, S, G)
+      z_block[, g] <- z_i[g] / S
+      augmented_z <- rbind(augmented_z, z_block)
+    }
+  }
+  
+  list(data = augmented_data, z = augmented_z)
+}
+
+
+logSumExp <- function(x) {
+  max_x <- max(x)
+  max_x + log(sum(exp(x - max_x)))
+}
+
+.conditional_mean <- function(x_obs, mu, sigma, observed) {
+  if (all(!observed)) {
+    return(mu)
+  } else {
+    mu_m <- mu[!observed]
+    sigma_mo <- sigma[!observed, observed, drop = FALSE]
+    sigma_oo_inv <- solve(sigma[observed, observed, drop = FALSE])
+    mu_m + sigma_mo %*% sigma_oo_inv %*% (x_obs - mu[observed])
+  }
+}
+
+.conditional_cov <- function(sigma, observed) {
+  if (all(!observed)) {
+    return(sigma)
+  } else {
+    sigma_mm <- sigma[!observed, !observed, drop = FALSE]
+    sigma_mo <- sigma[!observed, observed, drop = FALSE]
+    sigma_oo_inv <- solve(sigma[observed, observed, drop = FALSE])
+    sigma_mm - sigma_mo %*% sigma_oo_inv %*% t(sigma_mo)
+  }
+}
+
+.compute_observed_loglik <- function(X, params) {
+  loglik <- 0
+  G <- length(params$pro)
+  for (i in 1:nrow(X)) {
+    x_i <- X[i,]
+    observed <- !is.na(x_i)
+    x_obs <- x_i[observed]
+    
+    if (sum(observed) == 0) {
+      component_loglik <- log(params$pro)
+    } else {
+      component_loglik <- sapply(1:G, function(g) {
+        mu_g <- params$mean[observed, g]
+        sigma_g <- params$variance$sigma[observed, observed, g]
+        if (length(mu_g) == 0 || any(dim(sigma_g) == 0)) {
+          stop("Invalid subsetting for observation ", i, " and cluster ", g)
+        }
+        dmvnorm(x_obs, mu_g, sigma_g, log = TRUE) + log(params$pro[g])
+      })
+    }
+    if (length(component_loglik) == 0) {
+      stop("component_loglik has length zero for observation ", i)
+    }
+    loglik <- loglik + logSumExp(component_loglik)
+  }
+  loglik
+}
+
+# Generate data with missing values
+set.seed(123)
+n <- 50
+d <- 2
+G <- 2
+X <- matrix(rnorm(n * d), n, d)
+X[1, 1] <- NA  
+X[2, ] <- NA 
+
+# Run MMCEM1
+result1 <- mmcem(X, G = 2, modelName = "VVV", method = "MMCEM1", S = 20)
+print(result1$loglik)
+print(result1$converged)
+
+# Run MMCEM2
+result2 <- mmcem(X, G = 2, modelName = "VVV", method = "MMCEM2", S = 20)
+print(result2$loglik)
+print(result2$converged)
+
+```
+
+## Real data: Single cell
+```{r, warning=F, message=F}
+# library(GEOquery)
+# 
+# gset <- getGEO("GSE67835", GSEMatrix = TRUE, getGPL = FALSE)
+# if (length(gset) > 1) idx <- grep("GPL18573", attr(gset, "names")) else idx <- 1
+# gset <- gset[[idx]]
+# 
+# ex <- exprs(gset)
+# pd <- pData(gset) # same as gset@phenoData@data
+# rownames(ex)
+# 
+# getGEOSuppFiles("GSE67835")
+# 
+# 
+# # List out to check the cell types 
+# table(pd$`cell type:ch1`)
+# table(pd$`source_name_ch1`)
+# table(pd$`tissue:ch1`)
+# table(pd$`age:ch1`)
+# table(pd$`c1 chip id:ch1`)
+# 
+# # Create dataframe
+# celltype_col <- "cell type:ch1"
+# data_gene <- data.frame(
+#   status = pd[[celltype_col]],   
+#   t(ex)                     
+# )
+# 
+# data_gene$status <- factor(data_gene$status, 
+#                            levels = c("noncancerous", "carcinoma in situ",
+#                                       "invasive carcinoma"),
+#                            labels = unique(data_gene$status))
+# write.csv(data_gene, file = "data_gene.csv")
+data_file <- "real_data/databio-7projects-MV.txt"
+data_raw <- fread(data_file, header = FALSE, stringsAsFactors = FALSE)
+gene_names <- data_raw[[1]]  # First column contains gene names
+data_expr <- as.matrix(data_raw[, -1, with = FALSE])
+rownames(data_expr) <- gene_names
+
+missing_pattern <- "real_data/typeMV-7projects.txt"
+missing_raw <- fread(missing_pattern, header = FALSE, stringsAsFactors = FALSE)
+missing_expr <- as.matrix(missing_raw[, -1, with = FALSE])
+rownames(missing_expr) <- gene_names
+
+missing_data <- data_expr
+missing_data[missing_expr == 2 | missing_expr == 3] <- NA
+
+lambda_grid <- seq(1000, 2000, by = 50)
+rho_grid    <- seq(1, 5, by = 2) # very coarse list 
+impute_methods <- c("MAR","MNAR", "MNARcopula")
+
+ 
+
+
+res_transcriptome_varsel <- VarSelCluster(missing_data, 15:19)
+
+res_transcriptome_clustvarsel <- clustvarsel(data_expr, G=15:19,
+                                             search = "greedy", direction = "forward",
+                                            allow.EEE = FALSE,
+                                            forcetwo = FALSE,
+                                            parallel = TRUE)
+
+compute_nrmse(data_expr, res_transcriptome_selvar$imputedData, missing_data)
+summary(res_transcriptome_selvar)
+
+
+```
+
+## MMCEM2: new missing values imputation
+```{r}
+PartitionData <- function(data) {
+  
+  d <- ncol(data)
+  idx <- seq(1:nrow(data))
+  is_comp <- stats::complete.cases(data)
+  is_incomp <- !is_comp
+  
+  # Complete cases
+  data_comp <- data[is_comp, , drop = FALSE]
+  idx_comp <- idx[is_comp]
+  
+  # Incomplete cases
+  data_incomp <- data[is_incomp, , drop = FALSE]
+  idx_incomp <- idx[is_incomp]
+  
+  # Empty cases
+  is_empty <- apply(data_incomp, 1, function(x){
+    sum(is.na(x)) == d
+  })
+  data_empty <- data_incomp[is_empty, , drop = FALSE]
+  idx_empty <- idx_incomp[is_empty]
+  
+  # Remove empty cases
+  data_incomp <- data_incomp[!is_empty, , drop = FALSE]
+  idx_incomp <- idx_incomp[!is_empty]
+  
+  # Output
+  out <- list()
+  out$orig_row_names <- rownames(data)
+  out$orig_col_names <- colnames(data)
+  
+  out$n_row <- nrow(data)
+  out$n_col <- ncol(data)
+  
+  out$n0 <- nrow(data_comp)
+  out$n1 <- nrow(data_incomp)
+  out$n2 <- nrow(data_empty)
+  
+  out$data_comp <- data_comp
+  out$data_incomp <- data_incomp
+  out$data_empty <- data_empty
+  
+  out$idx_comp <- idx_comp
+  out$idx_incomp <- idx_incomp
+  out$idx_empty <- idx_empty
+  out$init_order <- c(idx_comp, idx_incomp, idx_empty)
+  return(out)
+}
+
+CalcCondDist <- function(y, idx_a, idx_b, mu, sigma) {
+  
+  # Split outcome.
+  y_b <- y[idx_b]
+  
+  # Split mean.
+  mu_a <- mu[idx_a]
+  mu_b <- mu[idx_b]
+  
+  # Split covariance.
+  sigma_aa <- sigma[idx_a, idx_a, drop = FALSE]
+  sigma_ab <- sigma[idx_a, idx_b, drop = FALSE]
+  sigma_bb <- sigma[idx_b, idx_b, drop = FALSE]
+  
+  # Calculate conditional mean and covariance.
+  mu_cond <- mu_a - sigma_ab %*% solve(sigma_bb, y_b - mu_b)
+  sigma_cond <- sigma_aa - sigma_ab %*% solve(sigma_bb, t(sigma_ab))
+  
+  out <- list(
+    mu = mu_cond,
+    sigma = sigma_cond
+  )
+  return(out)
+}
+
+EvalDensIncompObs <- function(y, means, covs, pi) {
+  k <- length(pi)
+  is_obs <- !is.na(y)
+  
+  obs_ele <- y[is_obs]
+  obs_dens <- numeric(k)
+  
+  for (j in 1:k) {
+    obs_mean <- as.numeric(means[[j]][is_obs])
+    obs_cov <- as.matrix(covs[[j]][is_obs, is_obs, drop = FALSE])
+    
+    # Check if covariance matrix positive definite
+    if (any(is.na(obs_cov)) || any(diag(obs_cov) <= 0) || 
+        (nrow(obs_cov) > 1 && det(obs_cov) <= 0)) {
+      warning("Observed covariance matrix may be ill-conditioned")
+      obs_dens[j] <- 0
+    } else {
+      tryCatch({
+        obs_dens[j] <- mvnfast::dmvn(X = obs_ele, mu = obs_mean, sigma = obs_cov) * pi[j]
+      }, error = function(e) {
+        obs_dens[j] <- 0
+        cat("Error in density calculation for component", j, ":", e$message, "\n")
+      })
+    }
+  }
+  
+  return(obs_dens)
+}
+
+Responsibility <- function(split_data, means, covs, pi) {
+  n0 <- split_data$n0
+  n1 <- split_data$n1
+  
+  k <- length(pi)
+
+  out <- list()
+  out$k <- k
+
+  # Density evaluation for complete observations.
+  if (n0 > 0) {
+    X_matrix <- as.matrix(split_data$data_comp)
+    
+    dens_eval0 <- matrix(0, nrow = n0, ncol = k)
+    for (j in 1:k) {
+      mu_vector <- as.numeric(means[[j]])
+      sigma_matrix <- as.matrix(covs[[j]])
+      
+      dens_eval0[, j] <- mvnfast::dmvn(
+        X = X_matrix,
+        mu = mu_vector,
+        sigma = sigma_matrix) * pi[j]
+    }
+
+    # Normalize by row to get responsibilities
+    row_sums <- rowSums(dens_eval0)
+    gamma0 <- dens_eval0 / row_sums
+    
+    colnames(dens_eval0) <- colnames(gamma0) <- paste0("k", 1:k)
+    rownames(dens_eval0) <- rownames(gamma0) <- 1:n0
+    out$dens_eval0 <- dens_eval0
+    out$gamma0 <- gamma0
+  }
+
+  # Evaluation for Incomplete observations.
+  if (n1 > 0) {
+    data_incomp <- as.matrix(split_data$data_incomp)
+    dens_eval1 <- matrix(0, nrow = n1, ncol = k)
+    
+    # Process each incomplete observation individually
+    for (i in 1:n1) {
+      x <- data_incomp[i, ]
+      dens <- EvalDensIncompObs(x, means, covs, pi)
+      dens_eval1[i, ] <- dens
+    }
+
+    # Normalize by row to get responsibilities
+    row_sums <- rowSums(dens_eval1)
+    gamma1 <- dens_eval1 / row_sums
+    
+    # Format results
+    colnames(dens_eval1) <- colnames(gamma1) <- paste0("k", 1:k)
+    rownames(dens_eval1) <- rownames(gamma1) <- 1:n1
+    out$dens_eval1 <- dens_eval1
+    out$gamma1 <- gamma1
+  }
+  
+  return(out)
+}
+
+MMCEM2 <- function(data, G, 
+                   S = 10, 
+                   max_iter = 20, tol = 1e-4, 
+                   cov_type = "VVV", MI=FALSE) {
+  # Initialize parameters using complete cases
+  split_data <- PartitionData(data)
+  comp_data <- split_data$data_comp
+  n <- nrow(data)
+  d <- ncol(data)
+  
+  # Initialize parameters using k-means on complete cases
+  if(nrow(comp_data) < G) {
+    stop("Number of complete cases is less than the number of clusters")
+  }
+  
+  init_kmeans <- kmeans(comp_data, centers = G)
+  pi <- table(init_kmeans$cluster)/nrow(comp_data)
+  means <- lapply(1:G, function(g) as.numeric(colMeans(comp_data[init_kmeans$cluster == g,,drop=F])))
+  covs <- lapply(1:G, function(g) cov(comp_data[init_kmeans$cluster == g,,drop=F]))
+  
+  loglik <- -Inf
+  converged <- FALSE
+  iter <- 0
+  
+  while(!converged && iter < max_iter) {
+    # E-step: Monte Carlo imputation and responsibilities
+    resp <- Responsibility(split_data, means, covs, pi)
+    
+    # Augment incomplete data with MC samples
+    if(split_data$n1 > 0) {
+      incomp_data <- split_data$data_incomp
+      aug_data <- list()
+      aug_weights <- list()
+      
+      for(i in 1:nrow(incomp_data)) {
+        y <- incomp_data[i,]
+        idx_miss <- which(is.na(y))
+        idx_obs <- which(!is.na(y))
+        
+        # Get responsibilities for current observation
+        gamma_i <- resp$gamma1[i,]
+        
+        # Generate S imputations per component
+        imputations <- lapply(1:G, function(g) {
+          cond_dist <- CalcCondDist(y, idx_miss, idx_obs, means[[g]], covs[[g]])
+          imps <- mvnfast::rmvn(S, mu = cond_dist$mu, sigma = cond_dist$sigma)
+          obs_matrix <- matrix(rep(y[idx_obs], S), nrow = S, byrow = TRUE)
+          cbind(obs_matrix, imps)[,order(c(idx_obs, idx_miss))]
+        })
+        
+        # Combine imputations and weights
+        aug_data[[i]] <- do.call(rbind, imputations)
+        aug_weights[[i]] <- rep(gamma_i, each = S)
+      }
+      
+      # Combine all augmented data
+      aug_data <- do.call(rbind, aug_data)
+      aug_weights <- unlist(aug_weights)
+    } else {
+      aug_data <- matrix(nrow = 0, ncol = d)
+      aug_weights <- numeric(0)
+    }
+    
+    # Combine complete and augmented data
+    full_data <- rbind(comp_data, aug_data)
+    
+    # Set up weights matrix correctly
+    if(split_data$n0 > 0) {
+      weights <- matrix(0, nrow = nrow(full_data), ncol = G)
+      weights[1:nrow(comp_data),] <- resp$gamma0
+      if(length(aug_weights) > 0) {
+        # Reshape aug_weights into a matrix
+        aug_weight_matrix <- matrix(aug_weights, ncol = G, byrow = TRUE)
+        weights[(nrow(comp_data) + 1):nrow(full_data),] <- aug_weight_matrix
+      }
+    } else {
+      weights <- matrix(aug_weights, ncol = G, byrow = TRUE)
+    }
+    
+    # M-step with mclust
+    mstep <- mclust::mstep(data = full_data, modelName = cov_type, z = weights)
+    
+    # Update parameters
+    new_means <- lapply(1:G, function(g) as.numeric(mstep$parameters$mean[,g]))
+    new_covs <- lapply(1:G, function(g) mstep$parameters$variance$sigma[,,g])
+    new_pi <- mstep$parameters$pro
+    
+    # Calculate new log-likelihood
+    new_resp <- Responsibility(split_data, new_means, new_covs, new_pi)
+    new_loglik <- 0
+    if(split_data$n0 > 0) {
+      new_loglik <- new_loglik + sum(log(rowSums(new_resp$dens_eval0)))
+    }
+    if(split_data$n1 > 0) {
+      new_loglik <- new_loglik + sum(log(rowSums(new_resp$dens_eval1)))
+    }
+    
+    # Check convergence
+    if(abs(new_loglik - loglik) < tol) converged <- TRUE
+    loglik <- new_loglik
+    means <- new_means
+    covs <- new_covs
+    pi <- new_pi
+    iter <- iter + 1
+    
+    cat("Iteration", iter, "- Log-likelihood:", loglik, "\n")
+  }
+  
+  # Calculate final responsibilities
+  final_resp <- Responsibility(split_data, means, covs, pi)
+  
+  # Determine cluster assignments
+  cluster <- NULL
+  if(split_data$n0 > 0) {
+    comp_clusters <- apply(final_resp$gamma0, 1, which.max)
+    cluster <- rep(NA, split_data$n_row)
+    cluster[split_data$idx_comp] <- comp_clusters
+  }
+  
+  if(split_data$n1 > 0) {
+    incomp_clusters <- apply(final_resp$gamma1, 1, which.max)
+    if(is.null(cluster)) {
+      cluster <- rep(NA, split_data$n_row)
+    }
+    cluster[split_data$idx_incomp] <- incomp_clusters
+  }
+  
+  # Imputation
+  imputed_data <- data
+  if(split_data$n1 > 0) {
+    incomp_data <- split_data$data_incomp
+    for(i in 1:nrow(incomp_data)) {
+      y <- incomp_data[i,]
+      idx_miss <- which(is.na(y))
+      idx_obs <- which(!is.na(y))
+
+      gamma_i <- final_resp$gamma1[i,]
+      
+      if (MI){
+        imputed_values <- matrix(0, nrow = S, ncol = length(idx_miss))
+        for (s in 1:S) {
+           # Sample a cluster based on responsibilities
+          cluster_idx <- sample(1:G, 1, prob = gamma_i)
+          cond_dist <- CalcCondDist(y, idx_miss, idx_obs, means[[cluster_idx]], covs[[cluster_idx]])
+          imputed_values[s,] <- mvnfast::rmvn(1, mu = cond_dist$mu, sigma = cond_dist$sigma)
+        }
+        # Weighted average imputation
+        weighted_imputation <- colSums(imputed_values) / S
+        imputed_data[split_data$idx_incomp[i], idx_miss] <- weighted_imputation
+      }
+      else {
+      best_cluster <- which.max(gamma_i)
+      cond_dist <- CalcCondDist(y, idx_miss, idx_obs, means[[best_cluster]], covs[[best_cluster]])
+      imputed_values <- mvnfast::rmvn(1, mu = cond_dist$mu, sigma = cond_dist$sigma)
+      imputed_data[split_data$idx_incomp[i], idx_miss] <- imputed_values
+    }
+    }
+  }
+  return(list(
+    means = means,
+    covs = covs,
+    pi = pi,
+    loglik = loglik,
+    iterations = iter,
+    cluster = cluster,
+    responsibilities = list(
+      complete = if(split_data$n0 > 0) final_resp$gamma0 else NULL,
+      incomplete = if(split_data$n1 > 0) final_resp$gamma1 else NULL
+    ),
+    imputedData = imputed_data
+  ))
+}
+
+set.seed(123)
+
+data_gen <- simulate_Maugis_data2012()
+true_data <- data_gen$data
+true_labels <- data_gen$class
+
+missing_gen <- produce_NA(true_data, 
+                      mechanism = "MAR",  # Option: MNAR, MAR
+                      perc.missing = 0.1)
+missing_data <- missing_gen$data.incomp
+
+res_selvarMNARz <- SelvarClustLasso(
+        x = missing_data,
+        nbcluster = 4,
+        # models="mixmodGaussianModel(family=\"all\")",
+        models = "VVV",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = 2,
+        nbcores = min(6, detectCores()),
+        impute_missing = TRUE,
+        scale_data = TRUE,
+        use_missing_pattern = TRUE
+      )
+
+
+fit <- MMCEM2(missing_data, G=4, S=100)
+fit2 <- MMCEM2(missing_data, G=4, S=100, MI=TRUE)
+
+fit3 <- SelvarClustLasso(
+        x = missing_data,
+        nbcluster = 4,
+        models = "VVV",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = 2,
+        nbcores = 6,
+        impute_missing = TRUE,
+        scale_data = TRUE
+      )
+fit4 <- SelvarClustLasso(
+        x = missing_data,
+        nbcluster = 4,
+        models="mixmodGaussianModel(family=\"diagonal\")",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = 2,
+        nbcores = 6,
+        impute_missing = TRUE,
+        scale_data = TRUE
+      )
+
+fit5 <- SelvarClustLasso(
+        x = missing_data,
+        nbcluster = 4,
+        models="gaussian_pk_sjk",
+        rmodel = c("LB", "LI", "LC"),
+        hsize = 2,
+        nbcores = 6,
+        impute_missing = TRUE,
+        scale_data = TRUE
+      )
+
+
+nrmse_wo_mi <- compute_nrmse(true_data, fit$imputedData, missing_data)
+nrmse_w_mi <- compute_nrmse(true_data, fit2$imputedData, missing_data)
+nrmse_mclust <- compute_nrmse(true_data, fit3$imputedData, missing_data)
+nrmse_mixmod <- compute_nrmse(true_data, fit4$imputedData, missing_data)
+# nrmse_mixall <- compute_nrmse(true_data, fit5$imputedData, missing_data)
+save(fit, fit2, fit3, fit4, file="compare_mmcem2.RData")
+
+
+
+# impute_methods <- list(
+#   MMCEM2 = function(data) {
+#     fit <- MMCEM2(data, G = 3, S = 10)
+#     GenImputation(fit)
+#   },
+#   MICE = function(data) {
+#     complete(mice(data, m = 1, printFlag = FALSE))
+#   },
+#   RF = function(data) {
+#     missForest(data)$ximp
+#   },
+#   Mean = function(data) {
+#     imp <- data
+#     for(j in 1:ncol(data)) {
+#       imp[,j] <- ifelse(is.na(imp[,j]), mean(imp[,j], na.rm = TRUE), imp[,j])
+#     }
+#     imp
+#   }
+# )
+
+# results <- lapply(names(impute_methods), function(method) {
+#   cat("Running", method, "...\n")
+#   imp <- tryCatch(
+#     impute_methods[[method]](missing_data),
+#     error = function(e) NULL
+#   )
+#   if(is.null(imp)) return(NULL)
+#   
+#   clust <- Mclust(imp, G = 3)$classification
+#   
+#   data.frame(
+#     Method = method,
+#     NRMSE = compute_nrmse(true_data, imp, missing_indices),
+#     ARI = ARI(true_labels, clust)
+#   )
+# }) |> Filter(f = Negate(is.null)) |> do.call(rbind, args = _)
+
+
+```
